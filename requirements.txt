@@ -12,3 +12,4 @@ uvicorn
 python-multipart
 pdfplumber
 PyJWT
+scikit-learn
