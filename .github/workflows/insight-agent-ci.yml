@@ -71,6 +71,62 @@ jobs:
         run: |
           python -m pytest -q tests/test_app_wiring.py
 
+      - name: Run python app.py smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ARIA_PORT=8000
+          python app.py > app-smoke.log 2>&1 &
+          APP_PID=$!
+          cleanup() { kill "$APP_PID" 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/api/health > health.json; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            cat app-smoke.log
+            exit 1
+          fi
+
+          curl -fsS http://127.0.0.1:8000/api/providers > providers.json
+          curl -fsS http://127.0.0.1:8000/openapi.json > openapi.json
+
+          python - <<'PY'
+          import json
+          schema = json.load(open('openapi.json', encoding='utf-8'))
+          paths = set(schema.get('paths', {}))
+          expected = {
+              '/api/auth/login',
+              '/api/connect',
+              '/api/schema',
+              '/api/ask',
+              '/api/insight',
+              '/api/health',
+              '/api/providers',
+          }
+          missing = expected - paths
+          if missing:
+              raise SystemExit('Missing runtime routes: ' + ', '.join(sorted(missing)))
+
+          from api import query_routes
+          from insight_agent_industry import IndustryInsightAgent
+          if query_routes.InsightAgent is not IndustryInsightAgent:
+              raise SystemExit('API is not wired to IndustryInsightAgent')
+
+          print('python app.py runtime wiring OK')
+          print('Insight Agent:', query_routes.InsightAgent.__name__)
+          print('Industry version:', query_routes.InsightAgent.VERSION)
+          PY
+
+          cat app-smoke.log
+
       - name: Run insight tests
         run: |
           python -m pytest -q \
