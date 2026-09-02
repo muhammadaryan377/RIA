@@ -11,6 +11,7 @@ on:
       - "tests/test_advanced_insight_agent.py"
       - "tests/test_encoded_prediction.py"
       - "tests/test_decision_intelligence.py"
+      - "tests/test_industry_insight_agent.py"
       - "requirements_insight_advanced.txt"
       - ".github/workflows/insight-agent-ci.yml"
   pull_request:
@@ -23,6 +24,7 @@ on:
       - "tests/test_advanced_insight_agent.py"
       - "tests/test_encoded_prediction.py"
       - "tests/test_decision_intelligence.py"
+      - "tests/test_industry_insight_agent.py"
       - "requirements_insight_advanced.txt"
 
 jobs:
@@ -59,4 +61,5 @@ jobs:
           pytest -q \
             tests/test_encoded_prediction.py \
             tests/test_advanced_insight_agent.py \
-            tests/test_decision_intelligence.py
+            tests/test_decision_intelligence.py \
+            tests/test_industry_insight_agent.py
