@@ -11,7 +11,7 @@ from core.config import get_session
 from core.deps import require_data, require_writable
 from core.validation import validate_goal_text
 from goal_agent import GoalAgent
-from insight_agent_advanced import InsightAgent, sanitize_json
+from insight_agent import InsightAgent, sanitize_json
 
 router = APIRouter()
 
@@ -95,7 +95,7 @@ def ask(request: Request, req: GoalRequest, user: dict = Depends(require_writabl
 
 @router.post("/api/insight")
 def insight(request: Request, user: dict = Depends(require_writable)):
-    """Run the advanced Insight Agent on the last processed data."""
+    """Run the Insight Agent on the last processed data."""
     session = get_session(user["user_id"])
     provider = require_data(request)
     if not session["processed_path"].exists():
