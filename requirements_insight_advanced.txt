@@ -1,0 +1,3 @@
+# Optional dependencies for insight_agent_advanced.py
+# Existing requirements.txt is intentionally left unchanged.
+scikit-learn
