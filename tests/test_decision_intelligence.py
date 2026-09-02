@@ -10,7 +10,8 @@ def _retail_frame():
             for category, category_factor in [("Beverages", 1.0), ("Electronics", 2.2)]:
                 for i in range(6):
                     qty = 2 + i
-                    discount = 0.05 if category == "Beverages" else 0.18
+                    base_discount = 0.05 if category == "Beverages" else 0.18
+                    discount = base_discount + (0.02 if region == "South" else 0.0)
                     sales = 100 * multiplier * region_factor * category_factor + qty * 6
                     profit = sales * (0.28 - discount * 0.55)
                     rows.append(
