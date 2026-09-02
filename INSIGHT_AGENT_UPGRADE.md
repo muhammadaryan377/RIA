@@ -1,10 +1,12 @@
 # ARIA Advanced Insight Agent
 
-The runtime Insight API now uses `insight_agent_advanced.py`, which extends the existing stable `insight_agent.py` rather than deleting its working chart, time-series prediction, hypothesis, prescription, and storytelling behavior.
+This upgrade is **additive**. The existing `insight_agent.py` is intentionally left unchanged and remains the current application runtime implementation.
 
 The architecture remains:
 
 `Schema Agent -> Goal Agent -> processed_data.json -> Insight Agent -> insights.json`
+
+The new `insight_agent_advanced.py` extends the existing `InsightAgent` as a subclass. This lets us improve the Insight layer without deleting, rewriting, or weakening the working KPI, chart, hypothesis, time-series prediction, prescription, and storytelling code.
 
 Prediction/encoding stays in the Insight layer. It is intentionally **not** moved into the Schema Agent.
 
@@ -30,15 +32,31 @@ Prediction/encoding stays in the Insight layer. It is intentionally **not** move
 - `executive_summary`: headline, supporting evidence and recommended checks
 - `analysis_version`: current advanced contract version
 
-## Runtime wiring
+## Existing files preserved
 
-`api/query_routes.py` imports the advanced agent for `POST /api/insight`.
+These existing project files are not required to be rewritten for the advanced implementation:
 
-## Install and test
+- `insight_agent.py`
+- `api/query_routes.py`
+- `prediction/__init__.py`
+- `requirements.txt`
+
+The advanced work is isolated in new files so it can be tested first and integrated only when desired.
+
+## New files
+
+- `insight_agent_advanced.py`
+- `prediction/tabular.py`
+- `requirements_insight_advanced.txt`
+- `tests/test_encoded_prediction.py`
+- `tests/test_advanced_insight_agent.py`
+
+## Install and test the advanced layer
 
 ```bash
 pip install -r requirements.txt
+pip install -r requirements_insight_advanced.txt
 pytest -q tests/test_encoded_prediction.py tests/test_advanced_insight_agent.py
 ```
 
-Then run the normal application and use the existing `/api/ask` -> `/api/insight` flow.
+The current application continues using the original agent until the advanced layer is explicitly selected for integration.
