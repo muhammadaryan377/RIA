@@ -4,7 +4,6 @@ python-dotenv
 langgraph
 pandas
 numpy
-scikit-learn
 sqlalchemy
 ollama
 groq
