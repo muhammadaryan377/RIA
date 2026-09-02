@@ -1,9 +1,11 @@
 """ARIA predictive analysis package.
 
-PredictionAgent turns processed data into a mathematically forecasted series
-(with honest walk-forward accuracy) - see prediction/agent.py.
+PredictionAgent handles mathematically validated time-series forecasting.
+TabularPredictor handles mixed numeric/categorical/date supervised prediction
+for the Insight Agent.
 """
 
 from .agent import PredictionAgent
+from .tabular import TabularPredictor
 
-__all__ = ["PredictionAgent"]
+__all__ = ["PredictionAgent", "TabularPredictor"]
