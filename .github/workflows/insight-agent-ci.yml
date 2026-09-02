@@ -4,27 +4,35 @@ on:
   push:
     branches: [main]
     paths:
+      - "api/query_routes.py"
+      - "app.py"
       - "insight_agent_advanced.py"
       - "insight_agent_industry.py"
       - "insight_extensions/**"
       - "prediction/tabular.py"
+      - "tests/test_app_wiring.py"
       - "tests/test_advanced_insight_agent.py"
       - "tests/test_encoded_prediction.py"
       - "tests/test_decision_intelligence.py"
       - "tests/test_industry_insight_agent.py"
+      - "requirements.txt"
       - "requirements_insight_advanced.txt"
       - ".github/workflows/insight-agent-ci.yml"
   pull_request:
     branches: [main]
     paths:
+      - "api/query_routes.py"
+      - "app.py"
       - "insight_agent_advanced.py"
       - "insight_agent_industry.py"
       - "insight_extensions/**"
       - "prediction/tabular.py"
+      - "tests/test_app_wiring.py"
       - "tests/test_advanced_insight_agent.py"
       - "tests/test_encoded_prediction.py"
       - "tests/test_decision_intelligence.py"
       - "tests/test_industry_insight_agent.py"
+      - "requirements.txt"
       - "requirements_insight_advanced.txt"
 
 jobs:
@@ -48,17 +56,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install -r requirements_insight_advanced.txt
           pip install pytest
 
-      - name: Compile advanced insight modules
+      - name: Compile application and insight modules
         run: |
+          python -m py_compile app.py
+          python -m py_compile api/query_routes.py
           python -m py_compile insight_agent_advanced.py
           python -m py_compile insight_agent_industry.py
           python -m py_compile insight_extensions/decision_intelligence.py
           python -m py_compile prediction/tabular.py
 
-      - name: Run additive insight tests
+      - name: Verify application wiring
+        run: |
+          python -m pytest -q tests/test_app_wiring.py
+
+      - name: Run insight tests
         run: |
           python -m pytest -q \
             tests/test_encoded_prediction.py \
