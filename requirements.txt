@@ -2,6 +2,13 @@ psycopg2-binary
 pymysql
 python-dotenv
 langgraph
+langchain
+langchain-core
+langchain-text-splitters
+langchain-postgres
+fastembed
+pymupdf
+psycopg[binary]
 pandas
 numpy
 sqlalchemy
