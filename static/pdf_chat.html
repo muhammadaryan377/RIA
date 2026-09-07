@@ -44,7 +44,7 @@
 <header>
   <div>
     <h1>ARIA — Insight Agent PDF Chat</h1>
-    <p style="margin:4px 0 0">Text PDFs + tables · LangChain · local BGE embeddings · hybrid RRF · GPT-OSS-20B on Groq</p>
+    <p style="margin:4px 0 0">Friendly chat + grounded PDF answers · text PDFs + tables · LangChain · local BGE embeddings · hybrid RRF · GPT-OSS-20B</p>
   </div>
   <div>
     <span class="pill">RAG is part of Insight Agent</span>
@@ -63,7 +63,7 @@
 
     <section class="panel" style="margin-top:16px">
       <h2>Your Documents</h2>
-      <p style="margin-top:0">Select the PDFs ARIA should search for this conversation.</p>
+      <p style="margin-top:0">Select the PDFs ARIA should search. Normal conversation works even without a selected PDF.</p>
       <div id="documents"></div>
       <button class="secondary" onclick="loadDocuments()">Refresh</button>
     </section>
@@ -71,13 +71,13 @@
 
   <section class="panel chat">
     <div style="display:flex;justify-content:space-between;gap:12px;align-items:center">
-      <h2 style="margin:0">Conversational PDF RAG</h2>
+      <h2 style="margin:0">Insight Agent Chat</h2>
       <button class="secondary" onclick="newConversation()">New conversation</button>
     </div>
-    <div class="status" id="chat_status">Upload/select a PDF and ask a grounded question.</div>
+    <div class="status" id="chat_status">Say hello, ask what I can do, or ask a grounded question about your PDFs.</div>
     <div id="messages"></div>
     <div class="composer">
-      <textarea id="question" placeholder="Ask about the selected PDF(s)…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();askPdf();}"></textarea>
+      <textarea id="question" placeholder="Say hello or ask about your PDF(s)…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();askPdf();}"></textarea>
       <button id="ask_btn" onclick="askPdf()">Ask</button>
     </div>
   </section>
@@ -149,16 +149,28 @@ function addMessage(role, text, sources=[]) {
 async function askPdf() {
   const q = $('question').value.trim(); const docs = selectedDocuments();
   if (!q) return;
-  if (!docs.length) { status('chat_status','Select at least one PDF.',false); return; }
-  addMessage('user',q); $('question').value=''; $('ask_btn').disabled=true; status('chat_status','Retrieving evidence and asking GPT-OSS-20B…');
+  addMessage('user',q); $('question').value=''; $('ask_btn').disabled=true;
+  status('chat_status', docs.length ? 'Understanding your message and retrieving evidence if needed…' : 'Understanding your message…');
   try {
-    const data = await api('/api/insight/pdf/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q,conversation_id:conversationId,document_ids:docs})});
+    const data = await api('/api/insight/pdf/chat',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:q,conversation_id:conversationId,document_ids:docs.length ? docs : null})
+    });
     conversationId = data.conversation_id; addMessage('assistant',data.answer,data.sources||[]);
-    status('chat_status',`${data.retrieval||'hybrid'} · ${data.retrieved_chunks||0} evidence chunks · ${data.model}`,true);
+    if (data.intent === 'smalltalk' || data.intent === 'capability') {
+      status('chat_status','Conversation · no PDF retrieval needed',true);
+    } else if (data.evidence_status === 'no_documents') {
+      status('chat_status','Upload a PDF when you want to ask document questions.',false);
+    } else if (data.evidence_status === 'insufficient') {
+      status('chat_status','No supporting evidence found in the selected PDF.',true);
+    } else {
+      status('chat_status',`${data.retrieval||'hybrid'} · ${data.retrieved_chunks||0} evidence chunks · ${data.model}`,true);
+    }
   } catch(e) { addMessage('assistant',`Error: ${e.message}`); status('chat_status',e.message,false); }
   finally { $('ask_btn').disabled=false; }
 }
-function newConversation() { conversationId=null; $('messages').innerHTML=''; status('chat_status','New conversation started.',true); }
+function newConversation() { conversationId=null; $('messages').innerHTML=''; status('chat_status','New conversation started. Say hello or ask about a PDF.',true); }
 if (!TOKEN) status('upload_status','Please sign in from the main ARIA page first.',false); else loadDocuments();
 </script>
 </body>
