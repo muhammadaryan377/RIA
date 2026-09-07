@@ -4,6 +4,6 @@ This module extends Insight Agent with conversational document intelligence; it
 is intentionally not a fifth autonomous agent.
 """
 
-from .system_layer import InsightPDFRAG
+from .scope_layer import InsightPDFRAG
 
 __all__ = ["InsightPDFRAG"]
