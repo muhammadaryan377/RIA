@@ -1,93 +1,143 @@
-"""Unit checks for user-friendly Insight Agent PDF-RAG conversation routing."""
+"""Tests for schema-validated semantic routing in ARIA Insight PDF-RAG."""
 
-from insight_rag.intent import (
-    conversational_reply,
-    is_broad_document_query,
-    lexical_evidence_score,
-    route_message,
-)
-from insight_rag.scope_layer import quick_scope_route
-from insight_rag.system_layer import detect_system_question
+import json
+
+from insight_rag.semantic_router import SemanticRouter
 
 
-def test_greetings_do_not_route_to_document_retrieval():
-    assert route_message("hello") == "smalltalk"
-    assert route_message("Good morning!") == "smalltalk"
-    assert route_message("thank you") == "smalltalk"
-    assert route_message("how are you?") == "smalltalk"
-    assert quick_scope_route("hello") == "CONVERSATION"
-    assert quick_scope_route("how are you?") == "CONVERSATION"
+DOCS = [
+    {"document_id": "doc-a", "filename": "Alpha.pdf", "pages": 5, "tables": 1},
+    {"document_id": "doc-b", "filename": "Beta.pdf", "pages": 8, "tables": 2},
+]
 
 
-def test_capability_questions_are_conversational():
-    assert route_message("what can you do?") == "capability"
-    assert route_message("what you can do i mean what you can find") == "capability"
-    reply = conversational_reply("what can you do?", "capability")
-    assert "text-based PDFs" in reply
-    assert "won't guess" in reply
+class FakeLLM:
+    def __init__(self, payload):
+        self.payload = payload
+        self.models = {}
+
+    def chat(self, role, messages, **kwargs):
+        assert role == "rag_scope"
+        return self.payload if isinstance(self.payload, str) else json.dumps(self.payload)
 
 
-def test_assistant_identity_questions_skip_pdf_retrieval():
-    assert detect_system_question("well which model you are") == "model"
-    assert detect_system_question("i mean what agent you are") == "agent"
-    assert detect_system_question("well what kind of agent uou are ]") == "agent"
-    assert detect_system_question("which llm are u using?") == "model"
-    assert detect_system_question("what embedding model do you use?") == "model"
-    assert detect_system_question("what version are you?") == "version"
-    assert quick_scope_route("why do you use pgvector?") == "SYSTEM"
-    assert quick_scope_route("how does your RAG retrieval work?") == "SYSTEM"
+def payload(**overrides):
+    base = {
+        "scope": "DOCUMENT",
+        "task": "DOCUMENT_QA",
+        "confidence": 0.95,
+        "needs_clarification": False,
+        "clarification_question": None,
+        "document_keys": ["D1"],
+        "target_pages": [],
+        "search_term": None,
+        "exact_search": False,
+        "broad_query": False,
+        "cross_document": False,
+        "needs_rewrite": False,
+        "needs_query_decomposition": False,
+        "prefer_tables": False,
+        "previous_action": "NONE",
+        "transform_instruction": None,
+        "metadata_kind": "NONE",
+        "table_operations": [],
+        "table_filter_operator": "NONE",
+        "table_filter_value": None,
+        "table_top_n": None,
+        "reason": "test route",
+    }
+    base.update(overrides)
+    return base
 
 
-def test_document_model_question_is_not_mistaken_for_assistant_identity():
-    assert detect_system_question("what model is mentioned in the PDF?") is None
-    assert detect_system_question("which model does this document describe?") is None
-    assert quick_scope_route("what model is mentioned in the PDF?") == "DOCUMENT"
+def test_document_route_resolves_model_document_key_to_owned_id():
+    router = SemanticRouter(FakeLLM(payload()))
+    decision = router.decide(
+        "Explain the metric from my report",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=["doc-a"],
+    )
+    assert decision.scope == "DOCUMENT"
+    assert decision.task == "DOCUMENT_QA"
+    assert decision.document_ids == ("doc-a",)
+    assert decision.requires_retrieval is True
 
 
-def test_general_world_knowledge_is_out_of_scope():
-    assert quick_scope_route("what is the capital of France?") == "OUT_OF_SCOPE"
-    assert quick_scope_route("who is the president of Pakistan?") == "OUT_OF_SCOPE"
-    assert quick_scope_route("what is the current weather in Dubai?") == "OUT_OF_SCOPE"
+def test_conversation_route_never_requires_document_retrieval():
+    router = SemanticRouter(
+        FakeLLM(payload(scope="CONVERSATION", task="CHAT", document_keys=[], confidence=0.99))
+    )
+    decision = router.decide(
+        "Nice to talk with you",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=None,
+    )
+    assert decision.scope == "CONVERSATION"
+    assert decision.requires_retrieval is False
 
 
-def test_document_questions_are_kept_grounded():
-    assert quick_scope_route("What was total revenue in 2025?") == "DOCUMENT"
-    assert quick_scope_route("Which product had the highest profit?") == "DOCUMENT"
-    assert quick_scope_route("Summarize page 4") == "DOCUMENT"
-    assert quick_scope_route("What is the capital of France in this PDF?") == "DOCUMENT"
+def test_system_route_is_separate_from_pdf_evidence():
+    router = SemanticRouter(
+        FakeLLM(payload(scope="SYSTEM", task="SYSTEM_INFO", document_keys=[], confidence=0.98))
+    )
+    decision = router.decide(
+        "Explain your retrieval architecture",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=None,
+    )
+    assert decision.scope == "SYSTEM"
+    assert decision.requires_retrieval is False
 
 
-def test_casual_non_factual_conversation_stays_conversational():
-    assert quick_scope_route("that's interesting") == "CONVERSATION"
-    assert quick_scope_route("great job") == "CONVERSATION"
-    assert quick_scope_route("I'm confused") == "CONVERSATION"
+def test_out_of_scope_route_does_not_become_document_query():
+    router = SemanticRouter(
+        FakeLLM(payload(scope="OUT_OF_SCOPE", task="OUT_OF_SCOPE", document_keys=[], confidence=0.99))
+    )
+    decision = router.decide(
+        "Tell me an unrelated world fact",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=None,
+    )
+    assert decision.scope == "OUT_OF_SCOPE"
+    assert decision.requires_retrieval is False
 
 
-def test_capability_phrase_with_pdf_target_still_routes_to_document_query():
-    assert route_message("what can you find in this pdf about revenue?") == "document_query"
+def test_low_confidence_sensitive_route_fails_to_clarification():
+    router = SemanticRouter(FakeLLM(payload(confidence=0.20)))
+    decision = router.decide(
+        "I mean that one",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=["doc-a", "doc-b"],
+    )
+    assert decision.scope == "CLARIFICATION"
+    assert decision.needs_clarification is True
+    assert decision.requires_retrieval is False
 
 
-def test_greeting_plus_real_question_still_routes_to_rag():
-    assert route_message("hello what was revenue in 2025?") == "document_query"
-    assert route_message("hi, which product had the highest profit?") == "document_query"
-    assert quick_scope_route("hello what was revenue in 2025?") == "DOCUMENT"
+def test_selected_document_boundary_blocks_unselected_key():
+    router = SemanticRouter(FakeLLM(payload(document_keys=["D2"])))
+    decision = router.decide(
+        "Use the report",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=["doc-a"],
+    )
+    assert decision.document_ids == ("doc-a",)
 
 
-def test_normal_document_questions_route_to_rag():
-    assert route_message("What was total revenue in 2025?") == "document_query"
-    assert route_message("Which product had the highest profit?") == "document_query"
-
-
-def test_broad_document_questions_are_recognised():
-    assert is_broad_document_query("Summarize this document")
-    assert is_broad_document_query("What is this PDF about?")
-    assert is_broad_document_query("What topics are in this PDF?")
-
-
-def test_lexical_evidence_score_prefers_matching_evidence():
-    question = "What was revenue in 2025?"
-    matching = ["Annual results: revenue in 2025 was 14.2 million dollars."]
-    unrelated = ["The company describes its employee onboarding policy and office locations."]
-
-    assert lexical_evidence_score(question, matching) > lexical_evidence_score(question, unrelated)
-    assert lexical_evidence_score(question, unrelated) == 0.0
+def test_invalid_router_output_fails_closed():
+    router = SemanticRouter(FakeLLM("not json"))
+    decision = router.decide(
+        "anything",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=None,
+    )
+    assert decision.scope == "CLARIFICATION"
+    assert decision.classifier_used is False
+    assert decision.requires_retrieval is False
