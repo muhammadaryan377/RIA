@@ -1,4 +1,8 @@
-"""Deterministic helpers for numeric reasoning over retrieved Markdown tables."""
+"""Deterministic numeric reasoning over retrieved Markdown tables.
+
+Natural-language intent is resolved by the semantic router. This module receives
+explicit operations and performs only auditable pandas calculations.
+"""
 
 from __future__ import annotations
 
@@ -7,22 +11,6 @@ from collections import defaultdict
 
 import pandas as pd
 from langchain_core.documents import Document
-
-_NUMERIC_INTENT = (
-    "total", "sum", "average", "avg", "mean", "highest", "lowest", "maximum", "minimum",
-    "max", "min", "top", "bottom", "compare", "difference", "percent", "percentage",
-    "how many", "count", "above", "below", "over", "under", "greater than", "less than",
-)
-_THRESHOLD_RE = re.compile(
-    r"\b(above|over|greater\s+than|more\s+than|at\s+least|below|under|less\s+than|at\s+most)\s*"
-    r"([$£€₹]?\s*[-+]?\d[\d,]*(?:\.\d+)?%?)",
-    re.IGNORECASE,
-)
-
-
-def has_numeric_table_intent(question: str) -> bool:
-    lowered = (question or "").lower()
-    return any(word in lowered for word in _NUMERIC_INTENT)
 
 
 def _split_markdown_row(line: str) -> list[str]:
@@ -86,8 +74,6 @@ def _numeric_series(frame: pd.DataFrame) -> dict[str, pd.Series]:
         valid = numeric.dropna()
         if valid.empty:
             continue
-        # Treat a column as numeric only when at least half its non-empty rows can
-        # be parsed as numbers. This avoids summing IDs/descriptions accidentally.
         non_empty = frame[column].astype(str).str.strip().ne("").sum()
         if len(valid) < max(1, int(non_empty * 0.5)):
             continue
@@ -112,8 +98,7 @@ def _relevant_numeric_columns(question: str, numeric: dict[str, pd.Series]) -> l
 
 
 def _label_columns(frame: pd.DataFrame, numeric_columns: set[str]) -> list[str]:
-    labels = [str(column) for column in frame.columns if str(column) not in numeric_columns]
-    return labels[:3]
+    return [str(column) for column in frame.columns if str(column) not in numeric_columns][:3]
 
 
 def _row_descriptor(frame: pd.DataFrame, index, label_columns: list[str]) -> str:
@@ -125,7 +110,7 @@ def _row_descriptor(frame: pd.DataFrame, index, label_columns: list[str]) -> str
     return ", ".join(parts) if parts else f"row {int(index) + 1}"
 
 
-def _threshold_matches(
+def _filter_matches(
     frame: pd.DataFrame,
     series: pd.Series,
     *,
@@ -134,34 +119,59 @@ def _threshold_matches(
     label_columns: list[str],
     column: str,
 ) -> list[str]:
-    op = operator.lower()
-    if op in {"above", "over", "greater than", "more than"}:
+    operator = operator.upper()
+    if operator == "GT":
         mask = series > threshold
-    elif op == "at least":
+    elif operator == "GTE":
         mask = series >= threshold
-    elif op in {"below", "under", "less than"}:
+    elif operator == "LT":
         mask = series < threshold
-    else:
+    elif operator == "LTE":
         mask = series <= threshold
+    else:
+        mask = series == threshold
 
     matches = []
     for index in frame.index[mask.fillna(False)]:
         descriptor = _row_descriptor(frame, index, label_columns)
         value = series.loc[index]
         matches.append(f"{descriptor}; {column}={float(value):g}")
-        if len(matches) >= 10:
+        if len(matches) >= 20:
             break
     return matches
 
 
-def build_table_facts(question: str, docs: list[Document]) -> str:
+def _rank_rows(
+    frame: pd.DataFrame,
+    series: pd.Series,
+    *,
+    label_columns: list[str],
+    column: str,
+    top_n: int,
+) -> list[str]:
+    valid = series.dropna().astype(float).sort_values(ascending=False).head(max(1, min(top_n, 20)))
+    return [
+        f"{_row_descriptor(frame, index, label_columns)}; {column}={float(value):g}"
+        for index, value in valid.items()
+    ]
+
+
+def build_table_facts(
+    question: str,
+    docs: list[Document],
+    *,
+    operations: tuple[str, ...] | list[str] = (),
+    filter_operator: str = "NONE",
+    filter_value: float | None = None,
+    top_n: int | None = None,
+) -> str:
     """Create deterministic facts from retrieved table rows.
 
-    The LLM receives these facts as supplemental evidence. Calculations are done
-    locally with pandas so totals, averages, extrema, threshold filters, and row
-    labels do not depend on model arithmetic.
+    ``operations`` comes from the validated semantic route, so this function
+    never guesses numeric intent from hard-coded user phrases.
     """
-    if not has_numeric_table_intent(question):
+    op_set = {str(operation).upper() for operation in operations}
+    if not op_set and filter_operator == "NONE":
         return ""
 
     grouped: dict[tuple, list[Document]] = defaultdict(list)
@@ -176,15 +186,6 @@ def build_table_facts(question: str, docs: list[Document]) -> str:
             meta.get("table_index"),
         )
         grouped[key].append(doc)
-
-    lowered = (question or "").lower()
-    wants_sum = any(word in lowered for word in ("total", "sum"))
-    wants_mean = any(word in lowered for word in ("average", "avg", "mean"))
-    wants_max = any(word in lowered for word in ("highest", "maximum", "max", "top"))
-    wants_min = any(word in lowered for word in ("lowest", "minimum", "min", "bottom"))
-    wants_count = "how many" in lowered or "count" in lowered
-    wants_compare = any(word in lowered for word in ("compare", "difference", "versus", " vs "))
-    threshold_match = _THRESHOLD_RE.search(question or "")
 
     sections = []
     for key, table_docs in grouped.items():
@@ -212,46 +213,49 @@ def build_table_facts(question: str, docs: list[Document]) -> str:
             if valid.empty:
                 continue
 
-            # For broad comparison questions provide compact descriptive facts;
-            # otherwise emit only the operations the user actually requested.
-            if wants_sum or wants_compare:
+            if "SUM" in op_set or "COMPARE" in op_set:
                 facts.append(f"{column} sum={float(valid.sum()):g}")
-            if wants_mean or wants_compare:
+            if "MEAN" in op_set or "COMPARE" in op_set:
                 facts.append(f"{column} mean={float(valid.mean()):g}")
-            if wants_count:
+            if "COUNT" in op_set:
                 facts.append(f"{column} count={int(valid.count())}")
-
-            if wants_max or wants_compare:
+            if "MAX" in op_set or "COMPARE" in op_set:
                 max_index = valid.idxmax()
                 facts.append(
                     f"{column} max={float(valid.loc[max_index]):g} at "
                     f"{_row_descriptor(frame, max_index, label_columns)}"
                 )
-            if wants_min or wants_compare:
+            if "MIN" in op_set or "COMPARE" in op_set:
                 min_index = valid.idxmin()
                 facts.append(
                     f"{column} min={float(valid.loc[min_index]):g} at "
                     f"{_row_descriptor(frame, min_index, label_columns)}"
                 )
 
-            if threshold_match:
-                operator = " ".join(threshold_match.group(1).lower().split())
-                threshold = _to_number(threshold_match.group(2))
-                if threshold is not None:
-                    matches = _threshold_matches(
-                        frame,
-                        series,
-                        operator=operator,
-                        threshold=float(threshold),
-                        label_columns=label_columns,
-                        column=column,
-                    )
-                    if matches:
-                        facts.append(
-                            f"{column} rows {operator} {float(threshold):g}: " + " | ".join(matches)
-                        )
-                    else:
-                        facts.append(f"{column} rows {operator} {float(threshold):g}: none")
+            if "FILTER" in op_set and filter_operator != "NONE" and filter_value is not None:
+                matches = _filter_matches(
+                    frame,
+                    series,
+                    operator=filter_operator,
+                    threshold=float(filter_value),
+                    label_columns=label_columns,
+                    column=column,
+                )
+                facts.append(
+                    f"{column} filter {filter_operator} {float(filter_value):g}: "
+                    + (" | ".join(matches) if matches else "none")
+                )
+
+            if "RANK" in op_set:
+                ranked = _rank_rows(
+                    frame,
+                    series,
+                    label_columns=label_columns,
+                    column=column,
+                    top_n=int(top_n or 5),
+                )
+                if ranked:
+                    facts.append(f"{column} ranked rows: " + " | ".join(ranked))
 
         if facts:
             sections.append(
