@@ -1,6 +1,6 @@
 """Context engineering for ARIA's Insight Agent PDF-RAG capability.
 
-This module is deliberately deterministic and cheap.  It handles conversation
+This module is deliberately deterministic and cheap. It handles conversation
 routing, document references, metadata questions, ambiguity, page targeting,
 text-search intent, and evidence selection before any expensive retrieval or
 LLM call is made.
@@ -56,12 +56,20 @@ _VAGUE_SEARCH_RE = re.compile(
     r"(?:\s+(?:the\s+)?(?:text|information|info|content|it|that|this))?[?!. ]*$",
     re.IGNORECASE,
 )
+_FOLLOWUP_VAGUE_RE = re.compile(
+    r"^(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:find|search(?:\s+for)?|locate|look\s+for)\s+(?:it|that|this)[?!. ]*$",
+    re.IGNORECASE,
+)
 _FIND_PREFIX_RE = re.compile(
     r"^(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:find|search(?:\s+for)?|locate|look\s+for)\s+(.+)$",
     re.IGNORECASE,
 )
 _PAGE_RE = re.compile(r"\bpages?\s+(\d{1,4})(?:\s*(?:-|to)\s*(\d{1,4}))?\b", re.IGNORECASE)
 _P_DOT_RE = re.compile(r"\bp\.?\s*(\d{1,4})\b", re.IGNORECASE)
+_SINGULAR_DOC_REF_RE = re.compile(
+    r"\b(?:this|that|the|current|same)\s+(?:pdf|document|file)\b",
+    re.IGNORECASE,
+)
 _ORDINALS = {
     "first": 0,
     "1st": 0,
@@ -149,6 +157,25 @@ class ContextEngineer:
                 reason="document inventory can be answered from manifest metadata",
             )
 
+        if self.needs_scope_clarification(
+            text,
+            history=history,
+            documents=documents,
+            selected_document_ids=selected_document_ids,
+        ):
+            names = self._active_document_names(documents, selected_document_ids)
+            return ContextPlan(
+                intent="clarification",
+                question=text,
+                document_ids=tuple(selected),
+                clarification=(
+                    "You have multiple PDFs selected. Which one do you mean? "
+                    + ", ".join(names[:5])
+                    + ("." if len(names) <= 5 else ", or another uploaded PDF?")
+                ),
+                reason="singular document reference is ambiguous",
+            )
+
         metadata_kind = self.metadata_query_kind(normalised)
         if metadata_kind:
             return ContextPlan(
@@ -159,19 +186,17 @@ class ContextEngineer:
             )
 
         if _VAGUE_SEARCH_RE.fullmatch(normalised):
-            # If the immediately previous user message contained a concrete target,
-            # "find it" can be handled as a follow-up; otherwise ask rather than guess.
-            previous_user = next(
-                (m.get("content", "") for m in reversed(history or []) if m.get("role") == "user"),
-                "",
-            )
-            if not previous_user or len(previous_user.split()) < 3:
+            # "find it/that/this" can be a real follow-up only when the previous
+            # assistant answer was grounded in a concrete source. Generic phrases
+            # like "can you find the text" always require clarification.
+            recent_sources = _history_source_ids(history)
+            if not (_FOLLOWUP_VAGUE_RE.fullmatch(normalised) and recent_sources):
                 return ContextPlan(
                     intent="clarification",
                     question=text,
                     document_ids=tuple(selected),
                     clarification="Sure. What exact text, phrase, topic, or information should I look for?",
-                    reason="search request has no target",
+                    reason="search request has no concrete target",
                 )
 
         term = self.extract_text_search_term(text)
@@ -202,6 +227,51 @@ class ContextEngineer:
         return None
 
     @staticmethod
+    def _active_document_names(documents: list[dict], selected_document_ids: list[str] | None) -> list[str]:
+        valid = {str(doc.get("document_id")): doc for doc in documents if doc.get("document_id")}
+        ids = [str(i) for i in (selected_document_ids or []) if str(i) in valid]
+        if not ids:
+            ids = list(valid)
+        return [str(valid[doc_id].get("filename") or "Untitled PDF") for doc_id in ids]
+
+    def needs_scope_clarification(
+        self,
+        text: str,
+        *,
+        history: list[dict],
+        documents: list[dict],
+        selected_document_ids: list[str] | None,
+    ) -> bool:
+        """Return True when a singular PDF reference could mean several PDFs."""
+        if not _SINGULAR_DOC_REF_RE.search(text or ""):
+            return False
+        docs = [doc for doc in documents if doc.get("document_id")]
+        valid = {str(doc["document_id"]) for doc in docs}
+        active = [str(i) for i in (selected_document_ids or []) if str(i) in valid]
+        if not active:
+            active = [str(doc["document_id"]) for doc in docs]
+        if len(active) <= 1:
+            return False
+
+        q = _norm(text)
+        if re.search(r"\b(?:all|both)\s+(?:pdfs?|documents?|files?)\b", q):
+            return False
+        if _history_source_ids(history):
+            return False
+
+        # Explicit filenames or ordinals remove the ambiguity.
+        for doc in docs:
+            filename = str(doc.get("filename") or "")
+            stem = Path(filename).stem.lower()
+            if filename.lower() in q or (len(stem) >= 4 and stem in q):
+                return False
+        if any(re.search(rf"\b{re.escape(label)}\s+(?:pdf|document|file)\b", q) for label in _ORDINALS):
+            return False
+        if re.search(r"\blast\s+(?:pdf|document|file)\b", q):
+            return False
+        return True
+
+    @staticmethod
     def extract_page_numbers(text: str) -> list[int]:
         pages: list[int] = []
         for match in _PAGE_RE.finditer(text or ""):
@@ -230,7 +300,12 @@ class ContextEngineer:
         if not match:
             return None
         term = match.group(1).strip(" ?!.")
-        term = re.sub(r"^(?:the\s+)?(?:text|phrase|word|words|topic|information|info)\s+(?:about\s+)?", "", term, flags=re.IGNORECASE)
+        term = re.sub(
+            r"^(?:the\s+)?(?:text|phrase|word|words|topic|information|info)\s+(?:about\s+)?",
+            "",
+            term,
+            flags=re.IGNORECASE,
+        )
         if _norm(term) in {"text", "the text", "information", "info", "content", "it", "that", "this"}:
             return None
         return term if len(term) >= 2 else None
