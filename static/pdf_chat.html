@@ -77,7 +77,7 @@
       <button class="secondary" onclick="newConversation()">New conversation</button>
     </div>
     <div class="status" id="chat_status">Say hello, ask how many PDFs you have, find exact text, or ask a grounded question.</div>
-    <div class="examples">Examples: “How many PDFs do I have?” · “Find ‘data science lifecycle’” · “Summarize page 4” · “Compare both PDFs”</div>
+    <div class="examples">Examples: “How many PDFs do I have?” · “Find ‘data science lifecycle’” · “Summarize page 4” · “Compare both PDFs” · “Make that shorter” · “Where did you find that?”</div>
     <div id="messages"></div>
     <div class="composer">
       <textarea id="question" placeholder="Chat normally or ask about your PDF(s)…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();askPdf();}"></textarea>
@@ -151,7 +151,10 @@ function addMessage(role, text, sources=[]) {
 }
 function updateChatStatus(data) {
   const noRetrieval = ['smalltalk','capability','document_inventory','document_metadata','clarification'];
-  if (noRetrieval.includes(data.intent)) {
+  const conversationAction = String(data.intent||'').startsWith('conversation_');
+  if (conversationAction) {
+    status('chat_status','Previous-answer context used · no new PDF retrieval needed',true);
+  } else if (noRetrieval.includes(data.intent)) {
     status('chat_status', data.intent === 'clarification' ? 'I need one detail before I search.' : 'Context-aware response · no PDF retrieval needed', true);
   } else if (data.retrieval === 'exact_text') {
     status('chat_status', `${data.retrieved_chunks||0} exact match source${(data.retrieved_chunks||0)===1?'':'s'}`, true);
