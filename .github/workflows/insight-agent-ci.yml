@@ -2,19 +2,24 @@ name: Insight Agent CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, insight-rag-pdf-v1]
     paths:
       - "api/query_routes.py"
+      - "api/insight_rag_routes.py"
       - "app.py"
       - "insight_agent_advanced.py"
       - "insight_agent_industry.py"
       - "insight_extensions/**"
+      - "insight_rag/**"
       - "prediction/tabular.py"
+      - "static/pdf_chat.html"
       - "tests/test_app_wiring.py"
       - "tests/test_advanced_insight_agent.py"
       - "tests/test_encoded_prediction.py"
       - "tests/test_decision_intelligence.py"
       - "tests/test_industry_insight_agent.py"
+      - "tests/test_insight_rag_context_engine.py"
+      - "tests/test_insight_rag_conversation.py"
       - "requirements.txt"
       - "requirements_insight_advanced.txt"
       - ".github/workflows/insight-agent-ci.yml"
@@ -22,23 +27,29 @@ on:
     branches: [main]
     paths:
       - "api/query_routes.py"
+      - "api/insight_rag_routes.py"
       - "app.py"
       - "insight_agent_advanced.py"
       - "insight_agent_industry.py"
       - "insight_extensions/**"
+      - "insight_rag/**"
       - "prediction/tabular.py"
+      - "static/pdf_chat.html"
       - "tests/test_app_wiring.py"
       - "tests/test_advanced_insight_agent.py"
       - "tests/test_encoded_prediction.py"
       - "tests/test_decision_intelligence.py"
       - "tests/test_industry_insight_agent.py"
+      - "tests/test_insight_rag_context_engine.py"
+      - "tests/test_insight_rag_conversation.py"
       - "requirements.txt"
       - "requirements_insight_advanced.txt"
+      - ".github/workflows/insight-agent-ci.yml"
 
 jobs:
   insight-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     env:
       PYTHONPATH: ${{ github.workspace }}
 
@@ -62,14 +73,27 @@ jobs:
         run: |
           python -m py_compile app.py
           python -m py_compile api/query_routes.py
+          python -m py_compile api/insight_rag_routes.py
           python -m py_compile insight_agent_advanced.py
           python -m py_compile insight_agent_industry.py
           python -m py_compile insight_extensions/decision_intelligence.py
           python -m py_compile prediction/tabular.py
+          python -m py_compile insight_rag/context_engine.py
+          python -m py_compile insight_rag/friendly.py
+          python -m py_compile insight_rag/intent.py
+          python -m py_compile insight_rag/pdf_ingest.py
+          python -m py_compile insight_rag/storage.py
+          python -m py_compile insight_rag/table_reasoner.py
 
       - name: Verify application wiring
         run: |
           python -m pytest -q tests/test_app_wiring.py
+
+      - name: Run RAG context-engineering tests
+        run: |
+          python -m pytest -q \
+            tests/test_insight_rag_conversation.py \
+            tests/test_insight_rag_context_engine.py
 
       - name: Run python app.py smoke test
         shell: bash
@@ -97,6 +121,7 @@ jobs:
 
           curl -fsS http://127.0.0.1:8000/api/providers > providers.json
           curl -fsS http://127.0.0.1:8000/openapi.json > openapi.json
+          curl -fsS http://127.0.0.1:8000/pdf-chat > pdf-chat.html
 
           python - <<'PY'
           import json
@@ -108,6 +133,10 @@ jobs:
               '/api/schema',
               '/api/ask',
               '/api/insight',
+              '/api/insight/pdf/upload',
+              '/api/insight/pdf/documents',
+              '/api/insight/pdf/documents/{document_id}',
+              '/api/insight/pdf/chat',
               '/api/health',
               '/api/providers',
           }
