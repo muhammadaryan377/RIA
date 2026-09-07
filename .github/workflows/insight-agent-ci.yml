@@ -84,12 +84,18 @@ jobs:
           python -m py_compile insight_agent_industry.py
           python -m py_compile insight_extensions/decision_intelligence.py
           python -m py_compile prediction/tabular.py
+          python -m py_compile insight_rag/config.py
           python -m py_compile insight_rag/context_engine.py
           python -m py_compile insight_rag/conversation_layer.py
+          python -m py_compile insight_rag/evidence.py
           python -m py_compile insight_rag/final_layer.py
           python -m py_compile insight_rag/friendly.py
-          python -m py_compile insight_rag/intent.py
           python -m py_compile insight_rag/pdf_ingest.py
+          python -m py_compile insight_rag/reranker.py
+          python -m py_compile insight_rag/runtime_profile.py
+          python -m py_compile insight_rag/scope_layer.py
+          python -m py_compile insight_rag/semantic_router.py
+          python -m py_compile insight_rag/service.py
           python -m py_compile insight_rag/storage.py
           python -m py_compile insight_rag/table_reasoner.py
 
