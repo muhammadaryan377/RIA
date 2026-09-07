@@ -22,6 +22,10 @@ def test_main_application_exposes_pipeline_routes():
         "/api/schema",
         "/api/ask",
         "/api/insight",
+        "/api/insight/pdf/upload",
+        "/api/insight/pdf/documents",
+        "/api/insight/pdf/documents/{document_id}",
+        "/api/insight/pdf/chat",
         "/api/health",
         "/api/providers",
     }
@@ -39,8 +43,10 @@ def test_app_starts_and_public_health_endpoints_respond():
         health = client.get("/api/health")
         providers = client.get("/api/providers")
         index = client.get("/")
+        pdf_chat = client.get("/pdf-chat")
 
     assert health.status_code == 200
     assert providers.status_code == 200
     assert index.status_code == 200
+    assert pdf_chat.status_code == 200
     assert "providers" in providers.json()
