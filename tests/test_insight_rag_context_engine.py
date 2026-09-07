@@ -55,6 +55,72 @@ def test_vague_find_request_asks_for_clarification():
     assert "What exact text" in (plan.clarification or "")
 
 
+def test_vague_find_still_clarifies_after_unrelated_long_history():
+    engine = ContextEngineer()
+    history = [
+        {"role": "user", "content": "well how many pdfs are you have", "sources": []},
+        {"role": "assistant", "content": "You currently have 2 PDFs.", "sources": []},
+    ]
+    plan = engine.plan(
+        "can you find the text",
+        history=history,
+        documents=DOCS,
+        selected_document_ids=["doc-a"],
+    )
+    assert plan.intent == "clarification"
+
+
+def test_find_it_can_use_recent_grounded_context():
+    engine = ContextEngineer()
+    history = [
+        {"role": "user", "content": "Where is the lifecycle mentioned?", "sources": []},
+        {
+            "role": "assistant",
+            "content": "It is discussed on page 2.",
+            "sources": [{"document_id": "doc-a", "filename": "First 3 topic.pdf", "page": 2}],
+        },
+    ]
+    plan = engine.plan(
+        "find it",
+        history=history,
+        documents=DOCS,
+        selected_document_ids=["doc-a"],
+    )
+    assert plan.intent == "document_query"
+    assert plan.document_ids == ("doc-a",)
+
+
+def test_ambiguous_singular_document_reference_clarifies():
+    engine = ContextEngineer()
+    plan = engine.plan(
+        "summarize this pdf",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=["doc-a", "doc-b"],
+    )
+    assert plan.intent == "clarification"
+    assert "multiple PDFs selected" in (plan.clarification or "")
+
+
+def test_recent_source_resolves_singular_document_reference():
+    engine = ContextEngineer()
+    history = [
+        {
+            "role": "assistant",
+            "content": "The result is in the sales report.",
+            "sources": [{"document_id": "doc-b", "filename": "Sales Report 2025.pdf", "page": 3}],
+        }
+    ]
+    plan = engine.plan(
+        "summarize this pdf",
+        history=history,
+        documents=DOCS,
+        selected_document_ids=["doc-a", "doc-b"],
+    )
+    assert plan.intent == "document_query"
+    assert plan.document_ids == ("doc-b",)
+
+
 def test_exact_find_extracts_term_without_running_inventory_logic():
     engine = ContextEngineer()
     plan = engine.plan(
