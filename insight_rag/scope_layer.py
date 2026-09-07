@@ -56,6 +56,23 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             "You can ask about ARIA, the Insight Agent/RAG system, or something that should be answered from your PDFs."
         )
 
+    @staticmethod
+    def _document_inventory_context(documents: list[dict]) -> str:
+        """Authoritative upload metadata safe to expose in non-document turns."""
+        if not documents:
+            return "No PDFs are currently uploaded/indexed for this user."
+        lines = [f"Uploaded/indexed PDFs: {len(documents)}"]
+        for index, document in enumerate(documents[:20], start=1):
+            lines.append(
+                f"{index}. {document.get('filename') or 'Untitled PDF'} "
+                f"({int(document.get('pages', 0) or 0)} pages, "
+                f"{int(document.get('tables', 0) or 0)} tables, "
+                f"{int(document.get('total_chunks', 0) or 0)} chunks)"
+            )
+        if len(documents) > 20:
+            lines.append(f"...and {len(documents) - 20} more PDFs")
+        return "\n".join(lines)
+
     def _system_context_answer(self, question: str, history: list[dict]) -> str:
         profile = self.runtime_profile.render()
         conversation = self.semantic_router._history_text(history)
@@ -91,33 +108,49 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                 "but the language-model service is temporarily unavailable."
             )
 
-    def _conversation_answer(self, question: str, history: list[dict]) -> str:
+    def _conversation_answer(
+        self,
+        question: str,
+        history: list[dict],
+        documents: list[dict],
+    ) -> str:
         conversation = self.semantic_router._history_text(history)
+        inventory = self._document_inventory_context(documents)
         messages = [
             {
                 "role": "system",
                 "content": (
                     "You are ARIA's bounded Insight Agent in a normal conversational turn. "
                     "Respond naturally to social interaction, acknowledgements, greetings, thanks or conversational clarification. "
-                    "Do not provide world-knowledge facts, current affairs, trivia, medical/legal/financial advice, or document claims. "
-                    "Do not pretend to have searched a PDF. Keep the response brief and friendly, and keep ARIA's scope clear when useful."
+                    "Do not provide world-knowledge facts, current affairs, trivia, medical/legal/financial advice, or claims about PDF contents. "
+                    "The supplied PDF inventory is authoritative metadata: you may accurately acknowledge whether PDFs are uploaded/indexed and may name/count them, but do not claim to have read or searched their contents in this conversational route. "
+                    "Never say that no PDF is uploaded when the inventory shows one or more PDFs. If the user's conversational wording appears to refer to an uploaded PDF, acknowledge the available PDF metadata and invite a concrete document question rather than inventing content. "
+                    "Keep the response brief and friendly, and keep ARIA's scope clear when useful."
                 ),
             },
             {
                 "role": "user",
-                "content": f"Recent conversation:\n{conversation}\n\nLatest message:\n{question}",
+                "content": (
+                    f"Authoritative PDF inventory:\n{inventory}\n\n"
+                    f"Recent conversation:\n{conversation}\n\n"
+                    f"Latest message:\n{question}"
+                ),
             },
         ]
         try:
             return self.llm.chat(
                 "rag",
                 messages,
-                temperature=0.25,
+                temperature=0.20,
                 num_predict=180,
                 timeout=12,
             ).strip()
         except Exception:
-            return "I'm here and ready. You can ask about ARIA or anything that should be answered from your uploaded PDFs."
+            if documents:
+                count = len(documents)
+                noun = "PDF" if count == 1 else "PDFs"
+                return f"I'm here and ready. You currently have {count} uploaded {noun}; ask me what you'd like to find or summarize."
+            return "I'm here and ready. You can ask about ARIA or upload a PDF and ask me about it."
 
     @staticmethod
     def _decorate_result(result: dict, decision: RouteDecision, request_id: str) -> dict:
@@ -181,7 +214,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             intent = "system"
             model = RAG_LLM_MODEL
         elif decision.scope == "CONVERSATION":
-            answer = self._conversation_answer(question, history)
+            answer = self._conversation_answer(question, history, documents)
             intent = "smalltalk"
             model = RAG_LLM_MODEL
         elif decision.scope == "CLARIFICATION":
