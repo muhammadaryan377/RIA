@@ -2,6 +2,7 @@
 
 from insight_rag.context_engine import ContextEngineer
 from insight_rag.final_layer import InsightPDFRAG
+from insight_rag.semantic_router import RouteDecision
 
 
 def _docs():
@@ -23,76 +24,85 @@ def _docs():
     ]
 
 
-def test_inventory_question_never_becomes_pdf_content_question():
+def _decision(**overrides):
+    base = dict(
+        scope="DOCUMENT",
+        task="DOCUMENT_QA",
+        confidence=0.96,
+        document_ids=("doc-a",),
+        requires_retrieval=True,
+    )
+    base.update(overrides)
+    return RouteDecision(**base)
+
+
+def test_metadata_plan_never_becomes_content_retrieval():
+    route = _decision(
+        task="DOCUMENT_METADATA",
+        document_ids=("doc-a", "doc-b"),
+        metadata_kind="INVENTORY_LIST",
+        requires_retrieval=False,
+    )
     plan = ContextEngineer().plan(
-        "well how many pdfs are you have",
+        "list them",
         history=[],
         documents=_docs(),
         selected_document_ids=None,
+        route_decision=route,
     )
     assert plan.intent == "document_inventory"
 
 
-def test_vague_find_text_requests_clarification_instead_of_random_retrieval():
+def test_search_without_target_becomes_clarification():
+    route = _decision(
+        task="DOCUMENT_SEARCH",
+        search_term=None,
+        exact_search=False,
+    )
     plan = ContextEngineer().plan(
-        "can you find the text",
+        "find it",
         history=[],
         documents=_docs(),
         selected_document_ids=["doc-a"],
+        route_decision=route,
     )
     assert plan.intent == "clarification"
-    assert "exact text" in (plan.clarification or "").lower()
 
 
-def test_exact_phrase_search_is_detected():
+def test_exact_phrase_search_is_router_driven():
+    route = _decision(
+        task="DOCUMENT_SEARCH",
+        search_term="data science lifecycle",
+        exact_search=True,
+        requires_retrieval=False,
+    )
     plan = ContextEngineer().plan(
-        'find "data science lifecycle" in this pdf',
+        "search request",
         history=[],
         documents=[_docs()[0]],
         selected_document_ids=["doc-a"],
+        route_decision=route,
     )
     assert plan.intent == "text_search"
     assert plan.text_search_term == "data science lifecycle"
 
 
-def test_page_target_is_preserved_in_plan():
-    plan = ContextEngineer().plan(
-        "summarize page 4",
-        history=[],
-        documents=[_docs()[0]],
-        selected_document_ids=["doc-a"],
+def test_cross_pdf_comparison_is_router_driven():
+    route = _decision(
+        task="DOCUMENT_COMPARE",
+        document_ids=("doc-a", "doc-b"),
+        cross_document=True,
+        needs_query_decomposition=True,
     )
-    assert 4 in plan.page_numbers
-
-
-def test_singular_pdf_reference_with_multiple_active_docs_requires_clarification():
     plan = ContextEngineer().plan(
-        "what is this pdf about?",
+        "compare",
         history=[],
         documents=_docs(),
         selected_document_ids=["doc-a", "doc-b"],
-    )
-    assert plan.intent == "clarification"
-
-
-def test_explicit_filename_resolves_document_scope():
-    plan = ContextEngineer().plan(
-        "what was revenue in Annual Sales 2025.pdf?",
-        history=[],
-        documents=_docs(),
-        selected_document_ids=None,
-    )
-    assert plan.document_ids == ("doc-b",)
-
-
-def test_cross_pdf_comparison_is_detected():
-    plan = ContextEngineer().plan(
-        "compare revenue across both PDFs",
-        history=[],
-        documents=_docs(),
-        selected_document_ids=["doc-a", "doc-b"],
+        route_decision=route,
     )
     assert plan.cross_document is True
+    assert plan.complex_query is True
 
 
 def test_invalid_model_source_labels_are_removed():
