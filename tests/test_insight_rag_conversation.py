@@ -76,6 +76,7 @@ def test_conversation_route_never_requires_document_retrieval():
     )
     assert decision.scope == "CONVERSATION"
     assert decision.requires_retrieval is False
+    assert decision.document_ids == ()
 
 
 def test_system_route_is_separate_from_pdf_evidence():
@@ -90,6 +91,7 @@ def test_system_route_is_separate_from_pdf_evidence():
     )
     assert decision.scope == "SYSTEM"
     assert decision.requires_retrieval is False
+    assert decision.document_ids == ()
 
 
 def test_out_of_scope_route_does_not_become_document_query():
@@ -104,6 +106,7 @@ def test_out_of_scope_route_does_not_become_document_query():
     )
     assert decision.scope == "OUT_OF_SCOPE"
     assert decision.requires_retrieval is False
+    assert decision.document_ids == ()
 
 
 def test_low_confidence_sensitive_route_fails_to_clarification():
@@ -117,9 +120,10 @@ def test_low_confidence_sensitive_route_fails_to_clarification():
     assert decision.scope == "CLARIFICATION"
     assert decision.needs_clarification is True
     assert decision.requires_retrieval is False
+    assert decision.document_ids == ()
 
 
-def test_selected_document_boundary_blocks_unselected_key():
+def test_selected_document_boundary_fails_closed_for_unselected_key():
     router = SemanticRouter(FakeLLM(payload(document_keys=["D2"])))
     decision = router.decide(
         "Use the report",
@@ -127,7 +131,48 @@ def test_selected_document_boundary_blocks_unselected_key():
         documents=DOCS,
         selected_document_ids=["doc-a"],
     )
-    assert decision.document_ids == ("doc-a",)
+    assert decision.scope == "CLARIFICATION"
+    assert decision.requires_retrieval is False
+    assert decision.document_ids == ()
+
+
+def test_inconsistent_scope_task_pair_fails_closed():
+    router = SemanticRouter(
+        FakeLLM(payload(scope="SYSTEM", task="DOCUMENT_QA", document_keys=["D1"], confidence=0.99))
+    )
+    decision = router.decide(
+        "ambiguous malformed route",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=["doc-a"],
+    )
+    assert decision.scope == "CLARIFICATION"
+    assert decision.task == "CLARIFY"
+    assert decision.requires_retrieval is False
+    assert decision.document_ids == ()
+
+
+def test_exact_search_is_local_and_does_not_require_vector_retrieval():
+    router = SemanticRouter(
+        FakeLLM(
+            payload(
+                task="DOCUMENT_SEARCH",
+                search_term="exact phrase",
+                exact_search=True,
+                confidence=0.99,
+            )
+        )
+    )
+    decision = router.decide(
+        "exact search",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=["doc-a"],
+    )
+    assert decision.scope == "DOCUMENT"
+    assert decision.task == "DOCUMENT_SEARCH"
+    assert decision.requires_retrieval is False
+    assert decision.search_term == "exact phrase"
 
 
 def test_invalid_router_output_fails_closed():
