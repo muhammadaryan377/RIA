@@ -108,20 +108,21 @@ def list_pdf_documents(user: dict = Depends(require_writable)):
 def delete_pdf_document(document_id: str, user: dict = Depends(require_writable)):
     """Delete owned PDF metadata + vector chunks without constructing an LLM."""
     metadata = RAGMetadataStore(user["user_id"])
-    record = metadata.get_document(document_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Document not found.")
-    try:
-        UserPGVectorStore(user["user_id"]).delete_chunks(record.get("chunk_ids", []))
-        metadata.remove_document(document_id)
-        metadata.document_file_path(document_id).unlink(missing_ok=True)
-        metadata.chunks_path(document_id).unlink(missing_ok=True)
-        return {"ok": True, "document_id": document_id}
-    except Exception:
-        raise HTTPException(
-            status_code=503,
-            detail="I couldn't delete that PDF from the search index right now. Please try again.",
-        )
+    with metadata.mutation_lock():
+        record = metadata.get_document(document_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        try:
+            UserPGVectorStore(user["user_id"]).delete_chunks(record.get("chunk_ids", []))
+            metadata.remove_document(document_id)
+            metadata.document_file_path(document_id).unlink(missing_ok=True)
+            metadata.chunks_path(document_id).unlink(missing_ok=True)
+            return {"ok": True, "document_id": document_id}
+        except Exception:
+            raise HTTPException(
+                status_code=503,
+                detail="I couldn't delete that PDF from the search index right now. Please try again.",
+            )
 
 
 @router.post("/chat")

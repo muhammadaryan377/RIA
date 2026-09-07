@@ -2,7 +2,7 @@ name: Insight Agent CI
 
 on:
   push:
-    branches: [main, insight-rag-pdf-v1]
+    branches: [main, insight-rag-pdf-v1, improve-rag-reliability]
     paths:
       - "api/query_routes.py"
       - "api/insight_rag_routes.py"
@@ -19,6 +19,7 @@ on:
       - "tests/test_encoded_prediction.py"
       - "tests/test_decision_intelligence.py"
       - "tests/test_industry_insight_agent.py"
+      - "tests/test_insight_rag*"
       - "tests/test_insight_rag_context_engine.py"
       - "tests/test_insight_rag_context_engineering.py"
       - "tests/test_insight_rag_conversation.py"
@@ -29,7 +30,7 @@ on:
       - "requirements_insight_advanced.txt"
       - ".github/workflows/insight-agent-ci.yml"
   pull_request:
-    branches: [main]
+    branches: [main, insight-rag-pdf-v1]
     paths:
       - "api/query_routes.py"
       - "api/insight_rag_routes.py"
@@ -46,6 +47,7 @@ on:
       - "tests/test_encoded_prediction.py"
       - "tests/test_decision_intelligence.py"
       - "tests/test_industry_insight_agent.py"
+      - "tests/test_insight_rag*"
       - "tests/test_insight_rag_context_engine.py"
       - "tests/test_insight_rag_context_engineering.py"
       - "tests/test_insight_rag_conversation.py"
@@ -110,13 +112,7 @@ jobs:
 
       - name: Run RAG context-engineering tests
         run: |
-          python -m pytest -q \
-            tests/test_insight_rag_conversation.py \
-            tests/test_insight_rag_context_engine.py \
-            tests/test_insight_rag_context_engineering.py \
-            tests/test_insight_rag_conversation_layer.py \
-            tests/test_insight_rag_structured_router.py \
-            tests/test_insight_rag_table_reasoner.py
+          ARIA_RAG_RERANKER_ENABLED=false python -m pytest -q tests/test_insight_rag*.py
 
       - name: Run python app.py smoke test
         shell: bash

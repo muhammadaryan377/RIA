@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import uuid
 
+from .diagnostics import TRACE, record
+from .grounding import REFUSAL, citation_integrity, verify_answer
+
 from langchain_core.documents import Document
 
 from .config import RECENT_HISTORY_TURNS, RAG_LLM_MODEL, RERANKER_ENABLED
 from .context_engine import ContextEngineer, ContextPlan
-from .evidence import lexical_evidence_score
+from .retrieval import deduplicate_chunks, fuse_ranked_lists
 from .reranker import LocalCrossEncoderReranker
 from .service import InsightPDFRAG as BaseInsightPDFRAG
 from .table_reasoner import build_table_facts
@@ -84,18 +87,10 @@ class InsightPDFRAG(BaseInsightPDFRAG):
         }
         if routing:
             turn_meta["routing"] = routing
-        self.conversations.append(
-            conversation_id,
-            "user",
-            question,
-            metadata={"intent": intent, "routing": routing or {}},
-        )
-        self.conversations.append(
-            conversation_id,
-            "assistant",
-            answer,
-            sources=sources or [],
-            metadata=turn_meta,
+        self.conversations.append_turn(
+            conversation_id, question=question, answer=answer, sources=sources or [],
+            user_metadata={"intent": intent, "routing": routing or {}},
+            assistant_metadata=turn_meta,
         )
 
     @staticmethod
@@ -270,9 +265,11 @@ class InsightPDFRAG(BaseInsightPDFRAG):
                 num_predict=160,
                 timeout=12,
             ).strip()
-            return rewritten or question
+            if not rewritten or len(rewritten) > 2000:
+                raise ValueError("Invalid rewritten query")
+            return rewritten
         except Exception:
-            return question
+            return ""
 
     def _expand_search_queries(self, question: str, plan: ContextPlan) -> list[str]:
         if not plan.complex_query:
@@ -310,16 +307,25 @@ class InsightPDFRAG(BaseInsightPDFRAG):
 
     def _retrieve_adaptive(self, queries: list[str], plan: ContextPlan) -> list[Document]:
         selected_ids = list(plan.document_ids)
-        page_docs = self._page_documents(selected_ids, list(plan.page_numbers)) if plan.page_numbers else []
+        # Explicit page scopes and broad summaries use the persisted corpus;
+        # vector availability cannot change their scope or page coverage.
+        if plan.page_numbers or plan.broad_query:
+            corpus = [doc for document_id in selected_ids
+                      for doc in self.metadata.load_chunks(document_id)]
+            return self.context_engine.select_evidence(
+                plan.question, corpus, selected_document_ids=selected_ids,
+                page_numbers=list(plan.page_numbers), broad_query=plan.broad_query,
+                cross_document=plan.cross_document, prefer_tables=plan.prefer_tables,
+            )
         gathered: list[Document] = []
 
         if plan.cross_document and 1 < len(selected_ids) <= 8:
             # Retrieve + rerank independently per document so one semantically
             # dominant PDF cannot erase evidence from the others.
             for document_id in selected_ids:
-                per_document: list[Document] = []
-                for query in queries[:2]:
-                    per_document.extend(
+                rankings: list[list[Document]] = []
+                for query in queries[:3]:
+                    rankings.append(
                         self._retrieve(
                             query,
                             [document_id],
@@ -329,14 +335,14 @@ class InsightPDFRAG(BaseInsightPDFRAG):
                 gathered.extend(
                     LocalCrossEncoderReranker.rerank(
                         queries[0],
-                        per_document,
+                        fuse_ranked_lists(rankings),
                         top_k=5,
                     )
                 )
         else:
-            candidates: list[Document] = []
-            for query in queries:
-                candidates.extend(
+            rankings: list[list[Document]] = []
+            for query in queries[:3]:
+                rankings.append(
                     self._retrieve(
                         query,
                         selected_ids,
@@ -345,13 +351,13 @@ class InsightPDFRAG(BaseInsightPDFRAG):
                 )
             gathered = LocalCrossEncoderReranker.rerank(
                 queries[0],
-                candidates,
+                fuse_ranked_lists(rankings),
                 top_k=10,
             )
 
         # Explicit page scope is a deterministic constraint and therefore remains
         # ahead of semantic reranking.
-        combined = page_docs + gathered
+        combined = gathered
         return self.context_engine.select_evidence(
             plan.question,
             combined,
@@ -369,26 +375,14 @@ class InsightPDFRAG(BaseInsightPDFRAG):
     def _semantic_evidence_check(self, question: str, docs: list[Document], plan: ContextPlan) -> bool:
         if not docs:
             return False
-        if plan.broad_query or plan.page_numbers:
+        if plan.cross_document:
+            found = {str(doc.metadata.get("document_id")) for doc in docs}
+            if set(plan.document_ids) - found:
+                return False
+        # Summary suitability is checked again against the generated answer.
+        if plan.task == "DOCUMENT_SUMMARY":
             return True
-
-        evidence_texts = [doc.page_content for doc in docs[:6]]
-        score = lexical_evidence_score(question, evidence_texts)
-        if score >= 0.50:
-            return True
-
-        snippets = []
-        used = 0
-        for doc in docs[:6]:
-            meta = doc.metadata
-            block = (
-                f"SOURCE {meta.get('filename')} p.{meta.get('page')} ({meta.get('content_type', 'text')}):\n"
-                f"{doc.page_content.strip()}"
-            )
-            if used + len(block) > 7000 and snippets:
-                break
-            snippets.append(block)
-            used += len(block)
+        context, _ = self._build_context(docs)
 
         messages = [
             {
@@ -401,7 +395,7 @@ class InsightPDFRAG(BaseInsightPDFRAG):
             },
             {
                 "role": "user",
-                "content": f"Question:\n{question}\n\nPDF evidence:\n" + "\n\n".join(snippets),
+                "content": f"Question:\n{question}\n\nPDF evidence:\n" + context,
             },
         ]
         try:
@@ -412,9 +406,11 @@ class InsightPDFRAG(BaseInsightPDFRAG):
                 num_predict=12,
                 timeout=10,
             ).strip().upper()
-            return decision.startswith("SUPPORTED")
+            record("evidence_verifier", "supported" if decision == "SUPPORTED" else "unsupported")
+            return decision == "SUPPORTED"
         except Exception:
-            return score >= 0.28
+            record("evidence_verifier", "unavailable")
+            return False
 
     def _secure_generate_answer(
         self,
@@ -476,7 +472,7 @@ class InsightPDFRAG(BaseInsightPDFRAG):
             raise ValueError("Question is too long.")
 
         conversation_id = conversation_id or uuid.uuid4().hex
-        payload = self.conversations.load(conversation_id)
+        payload = self.conversations.load_recent(conversation_id)
         history = payload.get("messages", [])
         documents = self.metadata.list_documents()
         plan = self._build_context_plan(
@@ -490,7 +486,6 @@ class InsightPDFRAG(BaseInsightPDFRAG):
         if plan.intent == "document_inventory":
             scoped = self._docs_for_ids(documents, list(plan.document_ids))
             answer = self.context_engine.inventory_answer(plan.metadata_kind, documents=scoped)
-            self._remember(conversation_id, question, answer, intent="document_inventory", document_ids=list(plan.document_ids))
             return self._base_result(
                 conversation_id=conversation_id,
                 question=question,
@@ -504,7 +499,6 @@ class InsightPDFRAG(BaseInsightPDFRAG):
             kind = plan.intent.split(":", 1)[1]
             scoped = self._docs_for_ids(documents, list(plan.document_ids))
             answer = self.context_engine.metadata_answer(kind, documents=scoped)
-            self._remember(conversation_id, question, answer, intent="document_metadata", document_ids=list(plan.document_ids))
             return self._base_result(
                 conversation_id=conversation_id,
                 question=question,
@@ -516,7 +510,6 @@ class InsightPDFRAG(BaseInsightPDFRAG):
 
         if plan.intent == "clarification":
             answer = plan.clarification or "Could you clarify what you want me to use or find?"
-            self._remember(conversation_id, question, answer, intent="clarification")
             return self._base_result(
                 conversation_id=conversation_id,
                 question=question,
@@ -527,7 +520,6 @@ class InsightPDFRAG(BaseInsightPDFRAG):
 
         if not documents or not plan.document_ids:
             answer = "Please upload a PDF first, then ask me a question about it."
-            self._remember(conversation_id, question, answer, intent="document_query")
             return self._base_result(
                 conversation_id=conversation_id,
                 question=question,
@@ -547,15 +539,6 @@ class InsightPDFRAG(BaseInsightPDFRAG):
             )
             if exact:
                 answer, sources = self._exact_text_answer(plan.text_search_term, exact)
-                self._remember(
-                    conversation_id,
-                    question,
-                    answer,
-                    intent="text_search",
-                    sources=sources,
-                    document_ids=selected_ids,
-                    search_query=plan.text_search_term,
-                )
                 return self._base_result(
                     conversation_id=conversation_id,
                     question=question,
@@ -570,14 +553,6 @@ class InsightPDFRAG(BaseInsightPDFRAG):
                 )
 
             answer = f"I couldn't find the exact text “{plan.text_search_term}” in the selected PDF."
-            self._remember(
-                conversation_id,
-                question,
-                answer,
-                intent="text_search",
-                document_ids=selected_ids,
-                search_query=plan.text_search_term,
-            )
             return self._base_result(
                 conversation_id=conversation_id,
                 question=question,
@@ -598,23 +573,28 @@ class InsightPDFRAG(BaseInsightPDFRAG):
             active_documents=active_docs,
             required=plan.needs_rewrite,
         )
+        if not search_query:
+            return self._base_result(
+                conversation_id=conversation_id, question=question,
+                answer="I couldn't resolve this follow-up right now. Please restate the full question, including the topic and year if relevant.",
+                intent="clarification", document_ids=selected_ids,
+                evidence_status="rewrite_unavailable", context_plan=plan_payload,
+            )
         queries = self._expand_search_queries(search_query, plan)
         retrieval_name = "hybrid_rrf_rerank" if RERANKER_ENABLED else "hybrid_rrf"
 
         try:
             evidence_docs = self._retrieve_adaptive(queries, plan)
+            trace = TRACE.get() or {}
+            retrieval_name = "local_corpus" if plan.page_numbers or plan.broad_query else (
+                "bm25_fallback" if trace.get("dense_degraded") else "hybrid_bm25_rrf"
+            )
+            if trace.get("reranker_status") == "applied":
+                retrieval_name += "_rerank"
         except Exception:
             answer = (
                 "I'm having trouble accessing the PDF search index right now. "
                 "Your uploaded PDFs are still safe; please try again in a moment."
-            )
-            self._remember(
-                conversation_id,
-                question,
-                answer,
-                intent="document_query",
-                document_ids=selected_ids,
-                search_query=search_query,
             )
             return self._base_result(
                 conversation_id=conversation_id,
@@ -629,16 +609,17 @@ class InsightPDFRAG(BaseInsightPDFRAG):
                 context_plan={**plan_payload, "search_queries": queries},
             )
 
-        if not evidence_docs or not self._semantic_evidence_check(search_query, evidence_docs, plan):
-            answer = "I couldn't find that information in the uploaded PDF."
-            self._remember(
-                conversation_id,
-                question,
-                answer,
-                intent="document_query",
-                document_ids=selected_ids,
-                search_query=search_query,
+        if plan.cross_document and set(selected_ids) - {str(doc.metadata.get("document_id")) for doc in evidence_docs}:
+            return self._base_result(
+                conversation_id=conversation_id, question=question,
+                answer="I couldn't find evidence from every selected PDF, so I can't make a balanced comparison. Try selecting fewer PDFs or asking a more specific question.",
+                intent="document_query", document_ids=selected_ids,
+                retrieval=retrieval_name, evidence_status="incomplete_comparison", context_plan=plan_payload,
             )
+        if not evidence_docs or not self._semantic_evidence_check(search_query, evidence_docs, plan):
+            unavailable = (TRACE.get() or {}).get("evidence_verifier") == "unavailable"
+            answer = ("The evidence verification service is temporarily unavailable. Please try again."
+                      if unavailable else "I couldn't find that information in the uploaded PDF.")
             return self._base_result(
                 conversation_id=conversation_id,
                 question=question,
@@ -647,15 +628,26 @@ class InsightPDFRAG(BaseInsightPDFRAG):
                 document_ids=selected_ids,
                 search_query=search_query,
                 retrieval=retrieval_name,
-                evidence_status="insufficient",
+                evidence_status="verification_unavailable" if unavailable else "insufficient",
                 model=RAG_LLM_MODEL,
                 context_plan={**plan_payload, "search_queries": queries},
             )
 
         context, sources = self._build_context(evidence_docs)
+        if not sources:
+            return self._base_result(
+                conversation_id=conversation_id, question=question,
+                answer="The available evidence exceeds the context limit. Please narrow the question or page range.",
+                intent="document_query", document_ids=selected_ids,
+                retrieval=retrieval_name, evidence_status="insufficient", context_plan=plan_payload,
+            )
+        visible_ids = {source.get("chunk_id") for source in sources}
+        visible_docs = [doc for doc in evidence_docs if doc.metadata.get("chunk_id") in visible_ids]
+        calculation_docs = deduplicate_chunks(self._expand_table_siblings(visible_docs))
         table_facts = build_table_facts(
-            question,
-            evidence_docs,
+            search_query,
+            calculation_docs,
+            sources=sources,
             operations=plan.table_operations,
             filter_operator=plan.table_filter_operator,
             filter_value=plan.table_filter_value,
@@ -663,13 +655,21 @@ class InsightPDFRAG(BaseInsightPDFRAG):
         )
         try:
             answer = self._secure_generate_answer(
-                question=question,
+                question=search_query,
                 context=context,
                 table_facts=table_facts,
                 history=history,
                 plan=plan,
             )
-            evidence_status = "supported"
+            integrity = citation_integrity(answer, sources)
+            verification = (
+                verify_answer(self.llm, question=search_query, answer=answer,
+                              context=context, table_facts=table_facts)
+                if integrity == "valid" else "verification_failed"
+            )
+            evidence_status = "supported" if verification == "verified" else verification
+            if verification != "verified":
+                answer, sources = REFUSAL, []
         except Exception:
             answer = (
                 "I found relevant PDF evidence, but I'm having trouble reaching the language model right now. "
@@ -677,25 +677,21 @@ class InsightPDFRAG(BaseInsightPDFRAG):
             )
             evidence_status = "model_unavailable"
 
-        self._remember(
-            conversation_id,
-            question,
-            answer,
-            intent="document_query",
-            sources=sources,
-            document_ids=selected_ids,
-            search_query=search_query,
-        )
-        return self._base_result(
-            conversation_id=conversation_id,
-            question=question,
-            answer=answer,
-            intent="document_query",
-            document_ids=selected_ids,
-            sources=sources,
-            search_query=search_query,
-            retrieval=retrieval_name,
-            evidence_status=evidence_status,
-            model=RAG_LLM_MODEL,
+        result = self._base_result(
+            conversation_id=conversation_id, question=question, answer=answer,
+            intent="document_query", document_ids=selected_ids, sources=sources,
+            search_query=search_query, retrieval=retrieval_name,
+            evidence_status=evidence_status, model=RAG_LLM_MODEL,
             context_plan={**plan_payload, "search_queries": queries},
         )
+        if plan.broad_query:
+            corpus = [doc for did in selected_ids for doc in self.metadata.load_chunks(did)]
+            total = {(str(doc.metadata.get("document_id")), doc.metadata.get("page")) for doc in corpus
+                     if not plan.page_numbers or doc.metadata.get("page") in plan.page_numbers}
+            covered = {(str(source.get("document_id")), source.get("page")) for source in sources}
+            result["coverage"] = {"available_pages": len(total), "context_pages": len(covered),
+                                  "sampled": len(covered) < len(total)}
+            if sources and len(covered) < len(total):
+                result["answer"] += (f"\n\nCoverage note: this overview uses excerpts from "
+                                     f"{len(covered)} of {len(total)} indexed pages.")
+        return result

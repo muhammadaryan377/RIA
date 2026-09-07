@@ -6,10 +6,12 @@ import json
 import os
 import re
 import threading
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from langchain_core.documents import Document
+from filelock import FileLock
 
 from .config import RAG_COLLECTION_PREFIX, RAG_DATABASE_URL, user_dir, user_key
 from .embeddings import FastBGEEmbeddings
@@ -26,15 +28,24 @@ def _read_json(path: Path, default):
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("Stored RAG data could not be read; restore it before retrying.") from exc
 
 
 def _atomic_write(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp, path)
+    temp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         suffix=".tmp", delete=False) as handle:
+            temp = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        if temp is not None:
+            temp.unlink(missing_ok=True)
 
 
 class RAGMetadataStore:
@@ -42,6 +53,9 @@ class RAGMetadataStore:
         self.user_id = str(user_id)
         self.root = user_dir(user_id)
         self.manifest_path = self.root / "manifest.json"
+
+    def mutation_lock(self):
+        return FileLock(str(self.root / "mutation.lock"), timeout=30)
 
     def load_manifest(self) -> dict:
         with _LOCK:
@@ -66,17 +80,20 @@ class RAGMetadataStore:
         return None
 
     def put_document(self, metadata: dict) -> None:
-        manifest = self.load_manifest()
-        manifest.setdefault("documents", {})[metadata["document_id"]] = metadata
-        self.save_manifest(manifest)
+        with FileLock(str(self.manifest_path) + ".lock", timeout=30):
+            manifest = self.load_manifest()
+            manifest.setdefault("documents", {})[metadata["document_id"]] = metadata
+            self.save_manifest(manifest)
 
     def remove_document(self, document_id: str) -> dict | None:
-        manifest = self.load_manifest()
-        removed = manifest.setdefault("documents", {}).pop(document_id, None)
-        self.save_manifest(manifest)
-        return removed
+        with FileLock(str(self.manifest_path) + ".lock", timeout=30):
+            manifest = self.load_manifest()
+            removed = manifest.setdefault("documents", {}).pop(document_id, None)
+            self.save_manifest(manifest)
+            return removed
 
     def chunks_path(self, document_id: str) -> Path:
+        ConversationStore._safe_id(document_id)
         return self.root / "chunks" / f"{document_id}.json"
 
     def save_chunks(self, document_id: str, documents: list[Document]) -> None:
@@ -99,6 +116,7 @@ class RAGMetadataStore:
         return result
 
     def document_file_path(self, document_id: str) -> Path:
+        ConversationStore._safe_id(document_id)
         return self.root / "documents" / f"{document_id}.pdf"
 
 
@@ -123,6 +141,29 @@ class ConversationStore:
             {"conversation_id": conversation_id, "created_at": _utc_now(), "messages": []},
         )
 
+    def load_recent(self, conversation_id: str, limit: int = 80) -> dict:
+        payload = self.load(conversation_id)
+        return {**payload, "messages": payload.get("messages", [])[-max(1, limit):]}
+
+    def turn_lock(self, conversation_id: str):
+        return FileLock(str(self._path(conversation_id)) + ".turn.lock", timeout=30)
+
+    def append_turn(self, conversation_id: str, *, question: str, answer: str,
+                    sources: list[dict], user_metadata: dict, assistant_metadata: dict) -> None:
+        """Commit a complete pair atomically while preserving the full transcript."""
+        path = self._path(conversation_id)
+        with FileLock(str(path) + ".write.lock", timeout=30):
+            payload = self.load(conversation_id)
+            messages = payload.setdefault("messages", [])
+            for role, content, evidence, metadata in (
+                ("user", question, [], user_metadata),
+                ("assistant", answer, sources, assistant_metadata),
+            ):
+                messages.append({"role": role, "content": content, "sources": evidence,
+                                 "metadata": metadata, "created_at": _utc_now()})
+            payload["updated_at"] = _utc_now()
+            _atomic_write(path, payload)
+
     def append(
         self,
         conversation_id: str,
@@ -136,7 +177,7 @@ class ConversationStore:
         Older conversation files without the ``metadata`` field remain fully
         compatible.  Metadata is internal and never treated as document evidence.
         """
-        with _LOCK:
+        with FileLock(str(self._path(conversation_id)) + ".write.lock", timeout=30):
             payload = self.load(conversation_id)
             payload.setdefault("messages", []).append(
                 {
@@ -194,6 +235,8 @@ class UserPGVectorStore:
             self.store.delete(ids=chunk_ids)
 
     def search(self, query: str, *, k: int, document_ids: list[str] | None = None):
+        if document_ids == []:
+            return []
         metadata_filter = None
         if document_ids:
             if len(document_ids) == 1:

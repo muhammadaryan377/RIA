@@ -224,87 +224,66 @@ class ContextEngineer:
             return []
 
         page_set = set(page_numbers or [])
+        allowed = set(selected_document_ids)
         unique: list[Document] = []
-        seen_ids: set[str] = set()
-        seen_content: set[str] = set()
+        seen_ids: set[tuple] = set()
+        seen_content: set[tuple] = set()
         for doc in docs:
-            chunk_id = str(doc.metadata.get("chunk_id") or "")
-            fingerprint = re.sub(r"\s+", " ", doc.page_content.strip().lower())[:500]
-            if chunk_id and chunk_id in seen_ids:
+            document_id = str(doc.metadata.get("document_id") or "")
+            page = int(doc.metadata.get("page", 0) or 0)
+            if document_id not in allowed or (page_set and page not in page_set):
                 continue
-            if fingerprint and fingerprint in seen_content:
+            chunk_id = str(doc.metadata.get("chunk_id") or "")
+            identity = (document_id, chunk_id)
+            # Equal text in different PDFs/pages is independent provenance.
+            fingerprint = (document_id, page, doc.metadata.get("table_index"),
+                           re.sub(r"\s+", " ", doc.page_content.strip().casefold()))
+            if (chunk_id and identity in seen_ids) or fingerprint in seen_content:
                 continue
             if chunk_id:
-                seen_ids.add(chunk_id)
-            if fingerprint:
-                seen_content.add(fingerprint)
+                seen_ids.add(identity)
+            seen_content.add(fingerprint)
             unique.append(doc)
 
-        if page_set:
-            unique.sort(
-                key=lambda document: (
-                    0 if int(document.metadata.get("page", 0) or 0) in page_set else 1,
-                    0 if prefer_tables and document.metadata.get("content_type") == "table" else 1,
-                )
-            )
-        elif prefer_tables:
-            unique.sort(key=lambda document: 0 if document.metadata.get("content_type") == "table" else 1)
-
+        if prefer_tables:
+            unique.sort(key=lambda doc: doc.metadata.get("content_type") != "table")
         max_docs = 8 if broad_query or cross_document else (6 if prefer_tables else 5)
         chosen: list[Document] = []
-        chosen_ids: set[str] = set()
+        chosen_ids: set[int] = set()
 
-        # Broad synthesis needs page coverage rather than many adjacent chunks.
         if broad_query:
+            # Sample pages across each complete document, then round-robin PDFs.
+            groups = []
             for document_id in selected_document_ids:
-                page_seen: set[int] = set()
-                candidates = [
-                    document
-                    for document in unique
-                    if str(document.metadata.get("document_id")) == str(document_id)
-                ]
-                candidates.sort(
-                    key=lambda document: (
-                        int(document.metadata.get("page", 0) or 0),
-                        0 if document.metadata.get("content_type") == "text" else 1,
-                    )
-                )
-                for document in candidates:
-                    page = int(document.metadata.get("page", 0) or 0)
-                    if page in page_seen:
-                        continue
-                    page_seen.add(page)
-                    cid = str(document.metadata.get("chunk_id") or id(document))
-                    chosen.append(document)
-                    chosen_ids.add(cid)
-                    if len(chosen) >= max_docs:
-                        return chosen
-
-        # Cross-document tasks must contain evidence from each document when
-        # retrieval found it, preventing one-sided comparisons.
-        if cross_document:
+                pages = {}
+                for doc in sorted(unique, key=lambda d: d.metadata.get("content_type") != "text"):
+                    if str(doc.metadata.get("document_id")) == document_id:
+                        pages.setdefault(int(doc.metadata.get("page", 0) or 0), doc)
+                candidates = [pages[page] for page in sorted(pages)]
+                if len(candidates) > max_docs:
+                    indices = [round(i * (len(candidates) - 1) / (max_docs - 1)) for i in range(max_docs)]
+                    candidates = [candidates[i] for i in indices]
+                groups.append(candidates)
+            # Allocate each PDF's quota across its full page range.
+            for i, group in enumerate(groups):
+                quota = max_docs // max(1, len(groups)) + (i < max_docs % max(1, len(groups)))
+                if len(group) > quota and quota > 0:
+                    groups[i] = [group[round(j * (len(group)-1) / max(1, quota-1))] for j in range(quota)]
+            for row in range(max_docs):
+                for group in groups:
+                    if row < len(group) and len(chosen) < max_docs:
+                        chosen.append(group[row])
+                        chosen_ids.add(id(group[row]))
+        elif cross_document:
             for document_id in selected_document_ids:
-                candidate = next(
-                    (
-                        document
-                        for document in unique
-                        if str(document.metadata.get("document_id")) == str(document_id)
-                    ),
-                    None,
-                )
+                candidate = next((d for d in unique if str(d.metadata.get("document_id")) == document_id), None)
                 if candidate is not None:
-                    cid = str(candidate.metadata.get("chunk_id") or id(candidate))
-                    if cid not in chosen_ids:
-                        chosen.append(candidate)
-                        chosen_ids.add(cid)
-
-        for document in unique:
-            cid = str(document.metadata.get("chunk_id") or id(document))
-            if cid in chosen_ids:
-                continue
-            chosen.append(document)
-            chosen_ids.add(cid)
+                    chosen.append(candidate)
+                    chosen_ids.add(id(candidate))
+        for doc in unique:
             if len(chosen) >= max_docs:
                 break
-
+            if id(doc) not in chosen_ids:
+                chosen.append(doc)
+                chosen_ids.add(id(doc))
         return chosen[:max_docs]
