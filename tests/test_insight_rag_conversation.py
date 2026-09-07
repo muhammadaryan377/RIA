@@ -6,6 +6,7 @@ from insight_rag.intent import (
     lexical_evidence_score,
     route_message,
 )
+from insight_rag.system_layer import detect_system_question
 
 
 def test_greetings_do_not_route_to_document_retrieval():
@@ -21,6 +22,20 @@ def test_capability_questions_are_conversational():
     reply = conversational_reply("what can you do?", "capability")
     assert "text-based PDFs" in reply
     assert "won't guess" in reply
+
+
+def test_assistant_identity_questions_skip_pdf_retrieval():
+    assert detect_system_question("well which model you are") == "model"
+    assert detect_system_question("i mean what agent you are") == "agent"
+    assert detect_system_question("well what kind of agent uou are ]") == "agent"
+    assert detect_system_question("which llm are u using?") == "model"
+    assert detect_system_question("what embedding model do you use?") == "model"
+    assert detect_system_question("what version are you?") == "version"
+
+
+def test_document_model_question_is_not_mistaken_for_assistant_identity():
+    assert detect_system_question("what model is mentioned in the PDF?") is None
+    assert detect_system_question("which model does this document describe?") is None
 
 
 def test_capability_phrase_with_pdf_target_still_routes_to_document_query():
