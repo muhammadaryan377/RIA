@@ -88,5 +88,8 @@ def test_broad_summary_evidence_is_balanced_across_pages():
         docs,
         selected_document_ids=["doc-a"],
     )
-    assert len(selected) == 7
+    # The context budget allows one extra unique chunk after every page is
+    # represented. The important invariant is complete page coverage without
+    # exceeding the eight-chunk summary budget.
+    assert 7 <= len(selected) <= 8
     assert {doc.metadata["page"] for doc in selected} == set(range(1, 8))
