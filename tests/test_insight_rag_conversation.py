@@ -17,9 +17,14 @@ def test_greetings_do_not_route_to_document_retrieval():
 
 def test_capability_questions_are_conversational():
     assert route_message("what can you do?") == "capability"
+    assert route_message("what you can do i mean what you can find") == "capability"
     reply = conversational_reply("what can you do?", "capability")
-    assert "uploaded text-based PDFs" in reply
-    assert "couldn't find" in reply
+    assert "text-based PDFs" in reply
+    assert "won't guess" in reply
+
+
+def test_capability_phrase_with_pdf_target_still_routes_to_document_query():
+    assert route_message("what can you find in this pdf about revenue?") == "document_query"
 
 
 def test_greeting_plus_real_question_still_routes_to_rag():
@@ -35,6 +40,7 @@ def test_normal_document_questions_route_to_rag():
 def test_broad_document_questions_are_recognised():
     assert is_broad_document_query("Summarize this document")
     assert is_broad_document_query("What is this PDF about?")
+    assert is_broad_document_query("What topics are in this PDF?")
 
 
 def test_lexical_evidence_score_prefers_matching_evidence():
