@@ -9,6 +9,7 @@ hard-coded greeting/capability/general-knowledge word lists.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -18,6 +19,8 @@ from pydantic import BaseModel, Field
 
 from .config import RAG_LLM_MODEL, ROUTER_MIN_CONFIDENCE, ROUTER_TIMEOUT_SECONDS
 
+
+logger = logging.getLogger(__name__)
 
 Scope = Literal["CONVERSATION", "SYSTEM", "DOCUMENT", "CLARIFICATION", "OUT_OF_SCOPE"]
 Task = Literal[
@@ -197,6 +200,72 @@ class SemanticRouter:
             if isinstance(value, dict):
                 return value
         raise ValueError("Router did not return a JSON object")
+
+    @staticmethod
+    def _strict_json_schema() -> dict:
+        """JSON Schema used by Groq constrained decoding for router decisions."""
+        properties = {
+            "scope": {
+                "type": "string",
+                "enum": ["CONVERSATION", "SYSTEM", "DOCUMENT", "CLARIFICATION", "OUT_OF_SCOPE"],
+            },
+            "task": {
+                "type": "string",
+                "enum": [
+                    "CHAT",
+                    "SYSTEM_INFO",
+                    "DOCUMENT_QA",
+                    "DOCUMENT_SUMMARY",
+                    "DOCUMENT_SEARCH",
+                    "DOCUMENT_METADATA",
+                    "DOCUMENT_COMPARE",
+                    "PREVIOUS_ANSWER",
+                    "CLARIFY",
+                    "OUT_OF_SCOPE",
+                ],
+            },
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "needs_clarification": {"type": "boolean"},
+            "clarification_question": {"type": ["string", "null"]},
+            "document_keys": {"type": "array", "items": {"type": "string"}},
+            "target_pages": {"type": "array", "items": {"type": "integer"}},
+            "search_term": {"type": ["string", "null"]},
+            "exact_search": {"type": "boolean"},
+            "broad_query": {"type": "boolean"},
+            "cross_document": {"type": "boolean"},
+            "needs_rewrite": {"type": "boolean"},
+            "needs_query_decomposition": {"type": "boolean"},
+            "prefer_tables": {"type": "boolean"},
+            "previous_action": {
+                "type": "string",
+                "enum": ["NONE", "SOURCES", "REPEAT", "TRANSFORM"],
+            },
+            "transform_instruction": {"type": ["string", "null"]},
+            "metadata_kind": {
+                "type": "string",
+                "enum": ["NONE", "INVENTORY_COUNT", "INVENTORY_LIST", "PAGES", "TABLES", "CHUNKS", "NAME"],
+            },
+            "table_operations": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["SUM", "MEAN", "MAX", "MIN", "COUNT", "COMPARE", "FILTER", "RANK"],
+                },
+            },
+            "table_filter_operator": {
+                "type": "string",
+                "enum": ["NONE", "GT", "GTE", "LT", "LTE", "EQ"],
+            },
+            "table_filter_value": {"type": ["number", "null"]},
+            "table_top_n": {"type": ["integer", "null"]},
+            "reason": {"type": "string"},
+        }
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": list(properties),
+            "additionalProperties": False,
+        }
 
     @staticmethod
     def _requires_retrieval(scope: Scope, task: Task, *, exact_search: bool) -> bool:
@@ -441,19 +510,50 @@ class SemanticRouter:
             f"Latest user message:\n{question}\n\n"
             "Produce the routing JSON now."
         )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
         started = time.perf_counter()
         try:
-            raw = self.llm.chat(
-                "rag_scope",
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.0,
-                num_predict=500,
-                timeout=ROUTER_TIMEOUT_SECONDS,
-            )
+            structured_chat = getattr(self.llm, "chat_structured", None)
+            if callable(structured_chat):
+                try:
+                    raw = structured_chat(
+                        "rag_scope",
+                        messages,
+                        json_schema=self._strict_json_schema(),
+                        schema_name="aria_rag_route",
+                        temperature=0.0,
+                        num_predict=900,
+                        timeout=ROUTER_TIMEOUT_SECONDS,
+                        reasoning_effort="low",
+                    )
+                except Exception as structured_exc:
+                    # Compatibility fallback for a provider/model that does not
+                    # expose strict structured outputs. It remains schema-validated
+                    # below and still fails closed if malformed.
+                    logger.warning(
+                        "Strict semantic router call failed; trying validated JSON fallback: %s",
+                        structured_exc,
+                    )
+                    raw = self.llm.chat(
+                        "rag_scope",
+                        messages,
+                        temperature=0.0,
+                        num_predict=900,
+                        timeout=ROUTER_TIMEOUT_SECONDS,
+                    )
+            else:
+                raw = self.llm.chat(
+                    "rag_scope",
+                    messages,
+                    temperature=0.0,
+                    num_predict=900,
+                    timeout=ROUTER_TIMEOUT_SECONDS,
+                )
+
             parsed = self._extract_json(raw)
             output = RouterOutput.model_validate(parsed)
             latency_ms = (time.perf_counter() - started) * 1000.0
@@ -466,6 +566,7 @@ class SemanticRouter:
             )
         except Exception as exc:
             latency_ms = (time.perf_counter() - started) * 1000.0
+            logger.warning("Semantic router unavailable: %s", exc)
             return RouteDecision(
                 scope="CLARIFICATION",
                 task="CLARIFY",
