@@ -1,7 +1,8 @@
-"""Fast conversational routing helpers for the Insight Agent PDF-RAG UI.
+"""Fast conversational routing helpers for ARIA Insight PDF-RAG.
 
-The goal is to keep obvious conversation (hello, thanks, capability questions)
-out of the retrieval path while still routing document questions to RAG.
+Obvious conversation is handled locally so greetings and capability questions do
+not waste embeddings, vector search, or cloud tokens. Everything factual that
+may require document evidence continues into the context-engineering layer.
 """
 
 from __future__ import annotations
@@ -10,37 +11,43 @@ import re
 
 
 _GREETING_RE = re.compile(
-    r"^(hi|hello|hey|hiya|salam|salaam|assalam(?:u)?\s*alaikum|good\s+(morning|afternoon|evening))"
+    r"^(hi|hello|hey|hiya|yo|salam|salaam|assalam(?:u)?\s*alaikum|good\s+(morning|afternoon|evening))"
     r"(?:\s+(there|aria|friend))?[!. ]*$",
     re.IGNORECASE,
 )
 _THANKS_RE = re.compile(
-    r"^(thanks|thank\s+you|thank\s+u|thx|jazakallah|jazak\s+allah|shukriya)[!. ]*$",
+    r"^(thanks|thank\s+you|thank\s+u|thx|jazakallah|jazak\s+allah|shukriya|appreciate\s+it)[!. ]*$",
     re.IGNORECASE,
 )
 _BYE_RE = re.compile(
-    r"^(bye|goodbye|see\s+you|see\s+ya|take\s+care)[!. ]*$",
+    r"^(bye|goodbye|see\s+you|see\s+ya|take\s+care|talk\s+later)[!. ]*$",
     re.IGNORECASE,
 )
 _HOW_ARE_YOU_RE = re.compile(
-    r"^(how\s+are\s+you|how\s+are\s+u|how's\s+it\s+going|what's\s+up|whats\s+up)[?!. ]*$",
+    r"^(how\s+are\s+you|how\s+are\s+u|how's\s+it\s+going|how\s+is\s+it\s+going|what's\s+up|whats\s+up)[?!. ]*$",
     re.IGNORECASE,
 )
 _ACK_RE = re.compile(
-    r"^(ok|okay|alright|great|nice|cool|perfect|done|got\s+it)[!. ]*$",
+    r"^(ok|okay|alright|great|nice|cool|perfect|done|got\s+it|understood|fine)[!. ]*$",
     re.IGNORECASE,
 )
 
 _CAPABILITY_PHRASES = (
     "what can you do",
+    "what you can do",
     "what do you do",
+    "what are you able to do",
     "how can you help",
+    "how you can help",
     "can you help me",
     "who are you",
     "what are you",
     "what can i ask",
+    "what should i ask",
     "how do i use this",
     "how does this work",
+    "what can you find",
+    "what you can find",
 )
 
 _BROAD_DOCUMENT_PHRASES = (
@@ -52,6 +59,8 @@ _BROAD_DOCUMENT_PHRASES = (
     "summarise this pdf",
     "what is this document about",
     "what is this pdf about",
+    "what are the topics in this pdf",
+    "what topics are in this pdf",
     "give me an overview",
     "give me a summary",
     "main points",
@@ -75,15 +84,18 @@ def _normalise(text: str) -> str:
 def route_message(text: str) -> str:
     """Return ``smalltalk``, ``capability`` or ``document_query``.
 
-    Routing is intentionally deterministic and local so greetings never trigger
-    embeddings/vector search or an unnecessary cloud LLM request.
+    Messages that mix a greeting with a real question deliberately continue to
+    document routing, e.g. ``hello, what was revenue in 2025?``.
     """
     normalised = _normalise(text)
     if not normalised:
         return "document_query"
 
-    if any(phrase in normalised for phrase in _CAPABILITY_PHRASES) and len(normalised.split()) <= 12:
-        return "capability"
+    if any(phrase in normalised for phrase in _CAPABILITY_PHRASES) and len(normalised.split()) <= 16:
+        # "what can you find in this pdf about revenue" is a document query, not
+        # a generic capability question.
+        if not re.search(r"\b(?:in|inside|from)\s+(?:this|the|my)\s+(?:pdf|document|file)\b", normalised):
+            return "capability"
 
     if (
         _GREETING_RE.fullmatch(normalised)
@@ -94,8 +106,6 @@ def route_message(text: str) -> str:
     ):
         return "smalltalk"
 
-    # Important: messages like "hello, what was revenue in 2025?" are not
-    # swallowed as small talk; they continue to the document retrieval path.
     return "document_query"
 
 
@@ -105,9 +115,9 @@ def conversational_reply(text: str, intent: str) -> str:
 
     if intent == "capability":
         return (
-            "I'm ARIA's Insight Agent. I can answer questions about your uploaded text-based PDFs, "
-            "including summaries, tables, comparisons, calculations, and follow-up questions. "
-            "If the answer is not supported by the PDF, I'll tell you that I couldn't find it."
+            "I'm ARIA's Insight Agent. I can chat normally and work with uploaded text-based PDFs: "
+            "find exact text, summarize sections, answer page questions, read tables, compare values and PDFs, "
+            "and understand follow-up questions. If the evidence is not in the PDF, I won't guess."
         )
 
     if _THANKS_RE.fullmatch(normalised):
@@ -129,8 +139,8 @@ def is_broad_document_query(text: str) -> bool:
 def lexical_evidence_score(question: str, evidence_texts: list[str]) -> float:
     """Return a conservative 0..1 lexical support score.
 
-    This is only a fast first-pass gate. Weak lexical matches can still be sent
-    to the semantic verifier so paraphrased questions are not incorrectly rejected.
+    This is only a first-pass gate. Weak lexical matches can still be sent to a
+    semantic verifier so paraphrases are not incorrectly rejected.
     """
     q_tokens = {
         token
