@@ -19,6 +19,25 @@ EMBEDDING_MODEL = os.getenv("ARIA_RAG_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"
 RAG_LLM_MODEL = os.getenv("ARIA_RAG_LLM_MODEL", "openai/gpt-oss-20b")
 RAG_COLLECTION_PREFIX = os.getenv("ARIA_RAG_COLLECTION_PREFIX", "aria_insight_pdf")
 
+# Semantic routing is intentionally model-driven. User utterances are not mapped
+# through phrase lists or regex intents; the router returns a validated schema.
+ROUTER_MIN_CONFIDENCE = float(os.getenv("ARIA_RAG_ROUTER_MIN_CONFIDENCE", "0.62"))
+ROUTER_TIMEOUT_SECONDS = int(os.getenv("ARIA_RAG_ROUTER_TIMEOUT_SECONDS", "10"))
+
+# Local cross-encoder reranking improves precision after hybrid retrieval while
+# preserving a graceful fallback when the model is unavailable.
+RERANKER_ENABLED = os.getenv("ARIA_RAG_RERANKER_ENABLED", "true").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+RERANKER_MODEL = os.getenv(
+    "ARIA_RAG_RERANKER_MODEL",
+    "Xenova/ms-marco-MiniLM-L-6-v2",
+)
+RERANKER_TOP_K = int(os.getenv("ARIA_RAG_RERANKER_TOP_K", "10"))
+
 MAX_PDF_MB = int(os.getenv("ARIA_RAG_MAX_PDF_MB", "50"))
 TEXT_CHUNK_SIZE = int(os.getenv("ARIA_RAG_TEXT_CHUNK_SIZE", "1500"))
 TEXT_CHUNK_OVERLAP = int(os.getenv("ARIA_RAG_TEXT_CHUNK_OVERLAP", "220"))
