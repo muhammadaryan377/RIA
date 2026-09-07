@@ -20,6 +20,7 @@ on:
       - "tests/test_industry_insight_agent.py"
       - "tests/test_insight_rag_context_engine.py"
       - "tests/test_insight_rag_conversation.py"
+      - "tests/test_insight_rag_conversation_layer.py"
       - "tests/test_insight_rag_table_reasoner.py"
       - "requirements.txt"
       - "requirements_insight_advanced.txt"
@@ -43,6 +44,7 @@ on:
       - "tests/test_industry_insight_agent.py"
       - "tests/test_insight_rag_context_engine.py"
       - "tests/test_insight_rag_conversation.py"
+      - "tests/test_insight_rag_conversation_layer.py"
       - "tests/test_insight_rag_table_reasoner.py"
       - "requirements.txt"
       - "requirements_insight_advanced.txt"
@@ -81,6 +83,7 @@ jobs:
           python -m py_compile insight_extensions/decision_intelligence.py
           python -m py_compile prediction/tabular.py
           python -m py_compile insight_rag/context_engine.py
+          python -m py_compile insight_rag/conversation_layer.py
           python -m py_compile insight_rag/friendly.py
           python -m py_compile insight_rag/intent.py
           python -m py_compile insight_rag/pdf_ingest.py
@@ -96,6 +99,7 @@ jobs:
           python -m pytest -q \
             tests/test_insight_rag_conversation.py \
             tests/test_insight_rag_context_engine.py \
+            tests/test_insight_rag_conversation_layer.py \
             tests/test_insight_rag_table_reasoner.py
 
       - name: Run python app.py smoke test
