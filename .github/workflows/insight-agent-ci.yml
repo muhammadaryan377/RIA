@@ -7,6 +7,7 @@ on:
       - "api/query_routes.py"
       - "api/insight_rag_routes.py"
       - "app.py"
+      - "llm_provider.py"
       - "insight_agent_advanced.py"
       - "insight_agent_industry.py"
       - "insight_extensions/**"
@@ -22,6 +23,7 @@ on:
       - "tests/test_insight_rag_context_engineering.py"
       - "tests/test_insight_rag_conversation.py"
       - "tests/test_insight_rag_conversation_layer.py"
+      - "tests/test_insight_rag_structured_router.py"
       - "tests/test_insight_rag_table_reasoner.py"
       - "requirements.txt"
       - "requirements_insight_advanced.txt"
@@ -32,6 +34,7 @@ on:
       - "api/query_routes.py"
       - "api/insight_rag_routes.py"
       - "app.py"
+      - "llm_provider.py"
       - "insight_agent_advanced.py"
       - "insight_agent_industry.py"
       - "insight_extensions/**"
@@ -47,6 +50,7 @@ on:
       - "tests/test_insight_rag_context_engineering.py"
       - "tests/test_insight_rag_conversation.py"
       - "tests/test_insight_rag_conversation_layer.py"
+      - "tests/test_insight_rag_structured_router.py"
       - "tests/test_insight_rag_table_reasoner.py"
       - "requirements.txt"
       - "requirements_insight_advanced.txt"
@@ -78,6 +82,7 @@ jobs:
       - name: Compile application and insight modules
         run: |
           python -m py_compile app.py
+          python -m py_compile llm_provider.py
           python -m py_compile api/query_routes.py
           python -m py_compile api/insight_rag_routes.py
           python -m py_compile insight_agent_advanced.py
@@ -110,6 +115,7 @@ jobs:
             tests/test_insight_rag_context_engine.py \
             tests/test_insight_rag_context_engineering.py \
             tests/test_insight_rag_conversation_layer.py \
+            tests/test_insight_rag_structured_router.py \
             tests/test_insight_rag_table_reasoner.py
 
       - name: Run python app.py smoke test
