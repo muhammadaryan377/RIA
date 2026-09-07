@@ -6,6 +6,7 @@ from insight_rag.intent import (
     lexical_evidence_score,
     route_message,
 )
+from insight_rag.scope_layer import quick_scope_route
 from insight_rag.system_layer import detect_system_question
 
 
@@ -14,6 +15,8 @@ def test_greetings_do_not_route_to_document_retrieval():
     assert route_message("Good morning!") == "smalltalk"
     assert route_message("thank you") == "smalltalk"
     assert route_message("how are you?") == "smalltalk"
+    assert quick_scope_route("hello") == "CONVERSATION"
+    assert quick_scope_route("how are you?") == "CONVERSATION"
 
 
 def test_capability_questions_are_conversational():
@@ -31,11 +34,33 @@ def test_assistant_identity_questions_skip_pdf_retrieval():
     assert detect_system_question("which llm are u using?") == "model"
     assert detect_system_question("what embedding model do you use?") == "model"
     assert detect_system_question("what version are you?") == "version"
+    assert quick_scope_route("why do you use pgvector?") == "SYSTEM"
+    assert quick_scope_route("how does your RAG retrieval work?") == "SYSTEM"
 
 
 def test_document_model_question_is_not_mistaken_for_assistant_identity():
     assert detect_system_question("what model is mentioned in the PDF?") is None
     assert detect_system_question("which model does this document describe?") is None
+    assert quick_scope_route("what model is mentioned in the PDF?") == "DOCUMENT"
+
+
+def test_general_world_knowledge_is_out_of_scope():
+    assert quick_scope_route("what is the capital of France?") == "OUT_OF_SCOPE"
+    assert quick_scope_route("who is the president of Pakistan?") == "OUT_OF_SCOPE"
+    assert quick_scope_route("what is the current weather in Dubai?") == "OUT_OF_SCOPE"
+
+
+def test_document_questions_are_kept_grounded():
+    assert quick_scope_route("What was total revenue in 2025?") == "DOCUMENT"
+    assert quick_scope_route("Which product had the highest profit?") == "DOCUMENT"
+    assert quick_scope_route("Summarize page 4") == "DOCUMENT"
+    assert quick_scope_route("What is the capital of France in this PDF?") == "DOCUMENT"
+
+
+def test_casual_non_factual_conversation_stays_conversational():
+    assert quick_scope_route("that's interesting") == "CONVERSATION"
+    assert quick_scope_route("great job") == "CONVERSATION"
+    assert quick_scope_route("I'm confused") == "CONVERSATION"
 
 
 def test_capability_phrase_with_pdf_target_still_routes_to_document_query():
@@ -45,6 +70,7 @@ def test_capability_phrase_with_pdf_target_still_routes_to_document_query():
 def test_greeting_plus_real_question_still_routes_to_rag():
     assert route_message("hello what was revenue in 2025?") == "document_query"
     assert route_message("hi, which product had the highest profit?") == "document_query"
+    assert quick_scope_route("hello what was revenue in 2025?") == "DOCUMENT"
 
 
 def test_normal_document_questions_route_to_rag():
