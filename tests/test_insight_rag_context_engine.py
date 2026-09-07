@@ -1,8 +1,9 @@
-"""Unit tests for deterministic context engineering in Insight PDF-RAG."""
+"""Unit tests for deterministic context engineering after semantic routing."""
 
 from langchain_core.documents import Document
 
 from insight_rag.context_engine import ContextEngineer
+from insight_rag.semantic_router import RouteDecision
 
 
 DOCS = [
@@ -12,7 +13,6 @@ DOCS = [
         "pages": 7,
         "tables": 1,
         "total_chunks": 14,
-        "created_at": "2026-09-07T10:00:00Z",
     },
     {
         "document_id": "doc-b",
@@ -20,166 +20,131 @@ DOCS = [
         "pages": 12,
         "tables": 4,
         "total_chunks": 28,
-        "created_at": "2026-09-06T10:00:00Z",
     },
 ]
 
 
-def test_inventory_question_does_not_use_rag():
+def decision(**overrides):
+    base = dict(
+        scope="DOCUMENT",
+        task="DOCUMENT_QA",
+        confidence=0.95,
+        document_ids=("doc-a",),
+        requires_retrieval=True,
+    )
+    base.update(overrides)
+    return RouteDecision(**base)
+
+
+def test_inventory_route_becomes_local_inventory_plan():
     engine = ContextEngineer()
+    route = decision(
+        task="DOCUMENT_METADATA",
+        document_ids=("doc-a", "doc-b"),
+        metadata_kind="INVENTORY_COUNT",
+        requires_retrieval=False,
+    )
     plan = engine.plan(
-        "well how many pdfs are you have",
+        "count my documents",
         history=[],
         documents=DOCS,
         selected_document_ids=None,
+        route_decision=route,
     )
     assert plan.intent == "document_inventory"
-    answer = engine.inventory_answer(
-        "how many pdfs do you have",
-        documents=DOCS,
-        selected_document_ids=None,
-    )
+    answer = engine.inventory_answer(plan.metadata_kind, documents=DOCS)
     assert "2 PDFs" in answer
-    assert "First 3 topic.pdf" in answer
 
 
-def test_vague_find_request_asks_for_clarification():
+def test_router_clarification_is_preserved_without_guessing():
     engine = ContextEngineer()
-    plan = engine.plan(
-        "can you find the text",
-        history=[],
-        documents=DOCS,
-        selected_document_ids=["doc-a"],
+    route = decision(
+        scope="CLARIFICATION",
+        task="CLARIFY",
+        confidence=0.80,
+        document_ids=(),
+        needs_clarification=True,
+        clarification_question="Which PDF should I use?",
+        requires_retrieval=False,
     )
-    assert plan.intent == "clarification"
-    assert "What exact text" in (plan.clarification or "")
-
-
-def test_vague_find_still_clarifies_after_unrelated_long_history():
-    engine = ContextEngineer()
-    history = [
-        {"role": "user", "content": "well how many pdfs are you have", "sources": []},
-        {"role": "assistant", "content": "You currently have 2 PDFs.", "sources": []},
-    ]
     plan = engine.plan(
-        "can you find the text",
-        history=history,
-        documents=DOCS,
-        selected_document_ids=["doc-a"],
-    )
-    assert plan.intent == "clarification"
-
-
-def test_find_it_can_use_recent_grounded_context():
-    engine = ContextEngineer()
-    history = [
-        {"role": "user", "content": "Where is the lifecycle mentioned?", "sources": []},
-        {
-            "role": "assistant",
-            "content": "It is discussed on page 2.",
-            "sources": [{"document_id": "doc-a", "filename": "First 3 topic.pdf", "page": 2}],
-        },
-    ]
-    plan = engine.plan(
-        "find it",
-        history=history,
-        documents=DOCS,
-        selected_document_ids=["doc-a"],
-    )
-    assert plan.intent == "document_query"
-    assert plan.document_ids == ("doc-a",)
-
-
-def test_ambiguous_singular_document_reference_clarifies():
-    engine = ContextEngineer()
-    plan = engine.plan(
-        "summarize this pdf",
+        "that one",
         history=[],
         documents=DOCS,
         selected_document_ids=["doc-a", "doc-b"],
+        route_decision=route,
     )
     assert plan.intent == "clarification"
-    assert "multiple PDFs selected" in (plan.clarification or "")
+    assert plan.clarification == "Which PDF should I use?"
 
 
-def test_recent_source_resolves_singular_document_reference():
+def test_exact_search_plan_uses_router_search_term():
     engine = ContextEngineer()
-    history = [
-        {
-            "role": "assistant",
-            "content": "The result is in the sales report.",
-            "sources": [{"document_id": "doc-b", "filename": "Sales Report 2025.pdf", "page": 3}],
-        }
-    ]
-    plan = engine.plan(
-        "summarize this pdf",
-        history=history,
-        documents=DOCS,
-        selected_document_ids=["doc-a", "doc-b"],
+    route = decision(
+        task="DOCUMENT_SEARCH",
+        search_term="data science lifecycle",
+        exact_search=True,
+        requires_retrieval=False,
     )
-    assert plan.intent == "document_query"
-    assert plan.document_ids == ("doc-b",)
-
-
-def test_exact_find_extracts_term_without_running_inventory_logic():
-    engine = ContextEngineer()
     plan = engine.plan(
-        'find "data science lifecycle"',
+        "locate it",
         history=[],
         documents=DOCS,
         selected_document_ids=["doc-a"],
+        route_decision=route,
     )
     assert plan.intent == "text_search"
     assert plan.text_search_term == "data science lifecycle"
+    assert plan.exact_search is True
+
+
+def test_page_scope_and_summary_flags_are_preserved():
+    route = decision(
+        task="DOCUMENT_SUMMARY",
+        target_pages=(4,),
+        broad_query=True,
+    )
+    plan = ContextEngineer().plan(
+        "summarize",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=["doc-a"],
+        route_decision=route,
+    )
+    assert plan.page_numbers == (4,)
+    assert plan.broad_query is True
+
+
+def test_unselected_document_id_cannot_enter_content_plan():
+    route = decision(document_ids=("doc-b",))
+    plan = ContextEngineer().plan(
+        "question",
+        history=[],
+        documents=DOCS,
+        selected_document_ids=["doc-a"],
+        route_decision=route,
+    )
     assert plan.document_ids == ("doc-a",)
 
 
-def test_page_range_is_resolved_and_capped():
-    engine = ContextEngineer()
-    assert engine.extract_page_numbers("summarize pages 2-4") == [2, 3, 4]
-    assert engine.extract_page_numbers("what is on p.7?") == [7]
-
-
-def test_this_pdf_resolves_from_recent_sources():
-    engine = ContextEngineer()
-    history = [
-        {"role": "user", "content": "what was revenue?", "sources": []},
-        {
-            "role": "assistant",
-            "content": "Revenue was reported in the sales PDF.",
-            "sources": [{"document_id": "doc-b", "filename": "Sales Report 2025.pdf", "page": 3}],
-        },
-    ]
-    plan = engine.plan(
-        "what is on page 4 of this pdf?",
-        history=history,
-        documents=DOCS,
-        selected_document_ids=None,
+def test_cross_document_comparison_and_table_plan_are_preserved():
+    route = decision(
+        task="DOCUMENT_COMPARE",
+        document_ids=("doc-a", "doc-b"),
+        cross_document=True,
+        prefer_tables=True,
+        table_operations=("COMPARE", "MAX"),
     )
-    assert plan.document_ids == ("doc-b",)
-    assert plan.page_numbers == (4,)
-
-
-def test_explicit_filename_overrides_broad_selection():
-    engine = ContextEngineer()
-    plan = engine.plan(
-        "summarize Sales Report 2025.pdf",
+    plan = ContextEngineer().plan(
+        "compare",
         history=[],
         documents=DOCS,
         selected_document_ids=["doc-a", "doc-b"],
-    )
-    assert plan.document_ids == ("doc-b",)
-
-
-def test_cross_document_comparison_is_detected():
-    engine = ContextEngineer()
-    plan = engine.plan(
-        "compare the main findings in both PDFs",
-        history=[],
-        documents=DOCS,
-        selected_document_ids=["doc-a", "doc-b"],
+        route_decision=route,
     )
     assert plan.cross_document is True
+    assert plan.prefer_tables is True
+    assert plan.table_operations == ("COMPARE", "MAX")
 
 
 def test_evidence_selection_deduplicates_and_diversifies():
@@ -199,10 +164,27 @@ def test_evidence_selection_deduplicates_and_diversifies():
         ),
     ]
     selected = engine.select_evidence(
-        "compare revenue in both PDFs",
+        "comparison",
         docs,
         selected_document_ids=["doc-a", "doc-b"],
         cross_document=True,
     )
     assert len(selected) == 2
-    assert {d.metadata["document_id"] for d in selected} == {"doc-a", "doc-b"}
+    assert {document.metadata["document_id"] for document in selected} == {"doc-a", "doc-b"}
+
+
+def test_broad_evidence_selection_balances_pages():
+    docs = [
+        Document(
+            page_content=f"content {page}",
+            metadata={"chunk_id": f"p{page}", "document_id": "doc-a", "page": page, "content_type": "text"},
+        )
+        for page in range(1, 8)
+    ]
+    selected = ContextEngineer.select_evidence(
+        "summary",
+        docs,
+        selected_document_ids=["doc-a"],
+        broad_query=True,
+    )
+    assert {document.metadata["page"] for document in selected} == set(range(1, 8))
