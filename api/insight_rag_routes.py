@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from core.deps import require_writable
-from insight_agent import InsightAgent
+from insight_agent_industry import InsightAgent
 from insight_rag import InsightPDFRAG
 from insight_rag.config import MAX_PDF_MB, RAG_LLM_MODEL
 from llm_provider import create_provider
@@ -32,8 +32,10 @@ def _capability(user_id: str | int) -> InsightPDFRAG:
         models={
             "rag": RAG_LLM_MODEL,
             "rag_rewrite": RAG_LLM_MODEL,
+            "rag_verify": RAG_LLM_MODEL,
         },
     )
+    # Use the same highest-capability Insight Agent that powers /api/insight.
     insight_agent = InsightAgent(provider=provider)
     return InsightPDFRAG(insight_agent=insight_agent, user_id=user_id)
 
