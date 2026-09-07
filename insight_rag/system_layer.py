@@ -23,6 +23,8 @@ _SYSTEM_TERMS = {
 _DOCUMENT_TERMS = {"pdf", "document", "file", "page", "table", "text"}
 _DOCUMENT_EVIDENCE_CUES = {
     "in", "inside", "from", "according", "mentioned", "written", "says", "stated",
+    "describe", "describes", "described", "discuss", "discusses", "discussed",
+    "contains", "contain", "shows", "show", "appears", "found",
 }
 
 
