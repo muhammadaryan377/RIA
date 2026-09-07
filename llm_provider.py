@@ -129,6 +129,65 @@ class LLMProvider:
             logging.warning(f"LLMProvider.{self.provider} chat failed ({role}): {exc}")
             raise
 
+    def chat_structured(
+        self,
+        role,
+        messages,
+        *,
+        json_schema,
+        schema_name="structured_response",
+        temperature=0.0,
+        num_predict=900,
+        timeout=None,
+        reasoning_effort="low",
+    ):
+        """Return schema-constrained JSON from the cloud provider.
+
+        This path is intended for control-plane decisions such as semantic routing.
+        It uses Groq Structured Outputs with strict constrained decoding so routing
+        does not depend on fragile prompt-only JSON formatting. Reasoning is kept
+        out of the returned assistant content to minimise latency and parsing risk.
+        """
+        if self.provider != "cloud":
+            raise RuntimeError("Strict structured output is currently available only on the cloud provider.")
+        if timeout is None:
+            timeout = 20
+        model = self.model_for(role)
+        if not model:
+            raise ValueError(f"No model configured for role '{role}'")
+        if not isinstance(json_schema, dict) or json_schema.get("type") != "object":
+            raise ValueError("json_schema must be a JSON Schema object definition.")
+
+        try:
+            completion = self._cloud_with_retry(
+                lambda: self._groq_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=num_predict,
+                    timeout=timeout,
+                    reasoning_effort=reasoning_effort,
+                    include_reasoning=False,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": schema_name,
+                            "strict": True,
+                            "schema": json_schema,
+                        },
+                    },
+                )
+            )
+            content = completion.choices[0].message.content
+            if not content:
+                raise RuntimeError("Structured LLM response was empty.")
+            return content.strip()
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            logging.warning(f"LLMProvider.{self.provider} structured chat failed ({role}): {exc}")
+            raise
+
     def complete(self, role, prompt, temperature=0.1, num_predict=400, timeout=None):
         """Generate a raw completion for `prompt`.
 
@@ -282,7 +341,6 @@ class LLMProvider:
 # ---------------------------------------------------------------------------
 # Convenience helpers
 # ---------------------------------------------------------------------------
-
 def create_provider(provider="local", api_key=None, models=None, base_url=None):
     """Build an LLMProvider.
 
