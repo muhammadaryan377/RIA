@@ -103,6 +103,8 @@ class RAGMetadataStore:
 
 
 class ConversationStore:
+    """Small persistent conversation store with optional per-turn context metadata."""
+
     def __init__(self, user_id: str | int):
         self.root = user_dir(user_id) / "conversations"
 
@@ -121,7 +123,19 @@ class ConversationStore:
             {"conversation_id": conversation_id, "created_at": _utc_now(), "messages": []},
         )
 
-    def append(self, conversation_id: str, role: str, content: str, sources=None) -> None:
+    def append(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        sources=None,
+        metadata: dict | None = None,
+    ) -> None:
+        """Append one message while preserving lightweight context for follow-ups.
+
+        Older conversation files without the ``metadata`` field remain fully
+        compatible.  Metadata is internal and never treated as document evidence.
+        """
         with _LOCK:
             payload = self.load(conversation_id)
             payload.setdefault("messages", []).append(
@@ -129,6 +143,7 @@ class ConversationStore:
                     "role": role,
                     "content": content,
                     "sources": sources or [],
+                    "metadata": metadata or {},
                     "created_at": _utc_now(),
                 }
             )
