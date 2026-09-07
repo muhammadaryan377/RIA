@@ -35,28 +35,58 @@ def test_markdown_table_parses_to_frame():
     assert len(frame) == 3
 
 
-def test_highest_profit_includes_row_label():
-    facts = build_table_facts("Which product had the highest profit?", [table_doc()])
+def test_max_operation_includes_row_label():
+    facts = build_table_facts(
+        "profit by product",
+        [table_doc()],
+        operations=("MAX",),
+    )
     assert "Profit max=25000" in facts
     assert "Product=Laptop" in facts
 
 
-def test_total_sales_is_computed_locally():
-    facts = build_table_facts("What is the total sales?", [table_doc()])
+def test_sum_operation_is_computed_locally():
+    facts = build_table_facts(
+        "sales",
+        [table_doc()],
+        operations=("SUM",),
+    )
     assert "Sales sum=275000" in facts
 
 
-def test_average_profit_is_computed_locally():
-    facts = build_table_facts("What is the average profit?", [table_doc()])
+def test_mean_operation_is_computed_locally():
+    facts = build_table_facts(
+        "profit",
+        [table_doc()],
+        operations=("MEAN",),
+    )
     assert "Profit mean=17333.3" in facts
 
 
-def test_threshold_filter_returns_matching_rows():
-    facts = build_table_facts("Which products have sales above 80000?", [table_doc()])
+def test_structured_filter_returns_matching_rows():
+    facts = build_table_facts(
+        "sales by product",
+        [table_doc()],
+        operations=("FILTER",),
+        filter_operator="GT",
+        filter_value=80000,
+    )
     assert "Product=Laptop" in facts
     assert "Product=Phone" in facts
     assert "Product=Tablet" not in facts
 
 
-def test_non_numeric_question_does_not_generate_math_facts():
-    assert build_table_facts("Describe the products in the table", [table_doc()]) == ""
+def test_rank_operation_returns_top_rows():
+    facts = build_table_facts(
+        "sales by product",
+        [table_doc()],
+        operations=("RANK",),
+        top_n=2,
+    )
+    assert "Product=Laptop" in facts
+    assert "Product=Phone" in facts
+    assert "Product=Tablet" not in facts
+
+
+def test_no_structured_operation_produces_no_math_facts():
+    assert build_table_facts("describe products", [table_doc()], operations=()) == ""
