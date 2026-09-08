@@ -118,8 +118,6 @@ def _strip_citations(text: str) -> str:
 def _normalise_shape(text: str, directive: PresentationDirective) -> str:
     text = (text or "").strip()
     if directive.shape == "ONE_LINE":
-        # One physical line, one concise sentence/statement. Remove bullet markers
-        # that may survive a provider rewrite, then collapse all whitespace.
         text = re.sub(r"(?m)^\s*[-*•]+\s*", "", text)
         return " ".join(text.split())
     if directive.shape == "PARAGRAPH":
@@ -127,15 +125,20 @@ def _normalise_shape(text: str, directive: PresentationDirective) -> str:
     return text
 
 
-def reformat_grounded_answer(llm, *, request: str, answer: str) -> str:
+def reformat_grounded_answer(
+    llm,
+    *,
+    request: str,
+    answer: str,
+    directive: PresentationDirective | None = None,
+) -> str:
     """Apply an explicit presentation request without changing source identity.
 
-    The rewrite is allowed to change wording/length only. Existing source labels
-    are preserved deterministically by ARIA rather than asking the model to emit
-    citation syntax. The caller's final grounding verifier still audits the
-    rewritten factual claims against PDF evidence.
+    Existing source labels are preserved deterministically by ARIA rather than
+    asking the model to recreate citation syntax. The caller's final grounding
+    verifier still audits the rewritten factual claims against PDF evidence.
     """
-    directive = infer_presentation(llm, request)
+    directive = directive or infer_presentation(llm, request)
     if not directive.explicit:
         return answer
 
@@ -146,8 +149,6 @@ def reformat_grounded_answer(llm, *, request: str, answer: str) -> str:
 
     structured = getattr(llm, "chat_structured", None)
     if not callable(structured):
-        # ONE_LINE can be enforced mechanically without changing facts. Other
-        # semantic rewrites are skipped if the provider cannot safely structure it.
         if directive.shape == "ONE_LINE":
             shaped = _normalise_shape(original, directive)
             suffix = " ".join(f"[{label}]" for label in labels)
@@ -202,7 +203,6 @@ def reformat_grounded_answer(llm, *, request: str, answer: str) -> str:
         suffix = " ".join(f"[{label}]" for label in labels)
         return (f"{text} {suffix}" if suffix else text).strip()
     except Exception:
-        # Presentation failure must not turn a valid grounded answer into a refusal.
         if directive.shape == "ONE_LINE":
             shaped = _normalise_shape(original, directive)
             suffix = " ".join(f"[{label}]" for label in labels)
