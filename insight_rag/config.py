@@ -16,7 +16,10 @@ RAG_DATABASE_URL = (
 ).strip()
 
 EMBEDDING_MODEL = os.getenv("ARIA_RAG_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-RAG_LLM_MODEL = os.getenv("ARIA_RAG_LLM_MODEL", "openai/gpt-oss-20b")
+RAG_LLM_MODEL = os.getenv(
+    "ARIA_RAG_LLM_MODEL",
+    os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+)
 RAG_COLLECTION_PREFIX = os.getenv("ARIA_RAG_COLLECTION_PREFIX", "aria_insight_pdf")
 
 # Semantic routing is intentionally model-driven. User utterances are not mapped
