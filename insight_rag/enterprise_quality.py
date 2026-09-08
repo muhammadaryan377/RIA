@@ -1,6 +1,6 @@
 """Deterministic enterprise quality signals for ARIA PDF-RAG.
 
-These helpers deliberately avoid model self-ratings.  They expose auditable
+These helpers deliberately avoid model self-ratings. They expose auditable
 signals derived from ingestion, retrieval, citations and verification so the UI,
 benchmarks and operations tooling can reason about answer quality without
 pretending a heuristic score is a calibrated probability.
@@ -24,7 +24,7 @@ _INSTRUCTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 def scan_untrusted_instructions(text: str) -> list[str]:
     """Return stable labels for instruction-like text found inside a PDF chunk.
 
-    A hit is a *risk signal*, not proof of malicious content.  PDF text remains
+    A hit is a *risk signal*, not proof of malicious content. PDF text remains
     evidence and is never executed as an instruction by the generation prompts.
     """
     value = text or ""
@@ -79,23 +79,33 @@ def assess_ingestion_quality(
 
 
 def _retrieval_consensus(sources: list[dict]) -> tuple[float | None, int]:
-    votes = []
+    scores: list[float] = []
     with_metadata = 0
     for source in sources:
-        value = source.get("retrieval_votes")
-        if value is None:
+        query_votes = source.get("retrieval_votes")
+        query_count = source.get("retrieval_query_count")
+        channel_votes = source.get("retrieval_channel_votes")
+        pieces: list[float] = []
+
+        try:
+            if query_votes is not None and query_count is not None and int(query_count) > 0:
+                pieces.append(min(1.0, max(0, int(query_votes)) / int(query_count)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        try:
+            if channel_votes is not None:
+                pieces.append(min(1.0, max(0, int(channel_votes)) / 2.0))
+        except (TypeError, ValueError):
+            pass
+
+        if not pieces:
             continue
         with_metadata += 1
-        try:
-            votes.append(max(0, int(value)))
-        except (TypeError, ValueError):
-            continue
-    if not votes:
+        scores.append(sum(pieces) / len(pieces))
+
+    if not scores:
         return None, with_metadata
-    # Two independent retrieval paths/subqueries agreeing is a strong signal;
-    # cap at three so query decomposition cannot inflate the score indefinitely.
-    normalised = [min(value, 3) / 3.0 for value in votes]
-    return sum(normalised) / len(normalised), with_metadata
+    return sum(scores) / len(scores), with_metadata
 
 
 def grounding_quality(
@@ -109,7 +119,7 @@ def grounding_quality(
     """Return a deterministic quality index for an already-produced response.
 
     The score is an operational heuristic (0..1), not a probability that the
-    answer is true.  A fail-closed verification result always scores zero.
+    answer is true. A fail-closed verification result always scores zero.
     """
     evidence_status = str(evidence_status or "")
     citation_status = str(citation_status or "")
