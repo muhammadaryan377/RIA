@@ -3,20 +3,17 @@ ARIA LLM Provider
 -----------------
 Unified interface over two LLM backends so the agents can run either:
 
-  * local  - Ollama (offline, private, data never leaves the machine)  [SLOW]
-  * cloud  - Groq API (fast, hosted inference)                          [FAST]
+  * local  - Ollama (offline, private, data never leaves the machine)
+  * cloud  - DeepSeek API (hosted inference)
 
-Every agent talks to `chat()` and never needs to know which backend it is.
-
-Privacy context shown to the user:
-    local: slow but your data stays on your machine (fully secure/offline)
-    cloud: fast, but your schema/queries are sent to the Groq API
+Every agent talks to ``chat()`` and does not need provider-specific code.
 """
 
+import json
 import logging
 import os
+import re
 import time
-from urllib.parse import quote_plus
 
 try:
     import ollama
@@ -25,15 +22,23 @@ except ImportError:
     OLLAMA_AVAILABLE = False
 
 try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
+    from openai import OpenAI
+    DEEPSEEK_AVAILABLE = True
 except ImportError:
-    GROQ_AVAILABLE = False
+    OpenAI = None
+    DEEPSEEK_AVAILABLE = False
 
-# Load .env centrally (in core.config) before any module-level os.getenv below.
+# Load .env centrally before module-level os.getenv calls below.
 import core.config  # noqa: E402,F401
 
 logging.basicConfig(level=logging.INFO)
+
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_VISION_MODEL = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp")
+DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "disabled").strip().lower()
+if DEEPSEEK_THINKING not in {"enabled", "disabled"}:
+    DEEPSEEK_THINKING = "disabled"
 
 # ---------------------------------------------------------------------------
 # Provider metadata
@@ -52,29 +57,26 @@ PROVIDERS = {
         },
     },
     "cloud": {
-        "label": "Cloud LLM (Groq API)",
-        "privacy": "Fast inference on Groq's LPU hardware, but your schema, queries and data samples are sent to the Groq API.",
+        "label": "Cloud LLM (DeepSeek API)",
+        "privacy": "Hosted DeepSeek inference. Your schema, queries, selected PDF evidence, and data samples may be sent to the DeepSeek API.",
         "models": {
-            "sql": "openai/gpt-oss-120b",
-            "story": "openai/gpt-oss-120b",
-            "suggest": "openai/gpt-oss-120b",
-            "semi": "openai/gpt-oss-120b",
-            "schema": "openai/gpt-oss-120b",
-            "vision": "qwen/qwen3.6-27b",
+            "sql": DEEPSEEK_MODEL,
+            "story": DEEPSEEK_MODEL,
+            "suggest": DEEPSEEK_MODEL,
+            "semi": DEEPSEEK_MODEL,
+            "schema": DEEPSEEK_MODEL,
+            "vision": DEEPSEEK_VISION_MODEL,
         },
     },
 }
 
-GROQ_MODEL = PROVIDERS["cloud"]["models"]["sql"]
-
-# Local Ollama models default to a small runtime context (often 4096 tokens),
-# which the schema-reasoning prompt + long output can exceed. Raise it so large
-# schemas are not rejected with an "exceeds the available context size" error.
 LOCAL_NUM_CTX = 8192
+_RETRY_AFTER_RE = re.compile(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
+_CONTROL_ROLES = {"rag_scope", "rag_verify", "rag_rewrite", "rag_plan"}
 
 
 class LLMProvider:
-    """Unified chat interface: local (Ollama) or cloud (Groq)."""
+    """Unified chat interface: local (Ollama) or cloud (DeepSeek)."""
 
     def __init__(self, provider="local", api_key=None, models=None, base_url=None):
         if provider not in PROVIDERS:
@@ -84,34 +86,32 @@ class LLMProvider:
         if models:
             self.models.update(models)
 
-        self._groq_client = None
+        self._cloud_client = None
         if provider == "cloud":
-            if not GROQ_AVAILABLE:
-                raise RuntimeError("groq package is not installed. Run: pip install groq")
-            # max_retries=0: the SDK's internal retry/backoff on 429s can block for
-            # minutes. We handle rate limits ourselves with a short, bounded retry.
-            self._groq_client = Groq(api_key=api_key or os.getenv("GROQ_API_KEY"), max_retries=0)
-            if not self._groq_client.api_key:
-                raise RuntimeError("Missing GROQ_API_KEY. Set it in .env or pass api_key.")
-
-    # -- model lookup ---------------------------------------------------
+            if not DEEPSEEK_AVAILABLE:
+                raise RuntimeError("openai package is not installed. Run: pip install openai")
+            key = api_key or os.getenv("DEEPSEEK_API_KEY")
+            if not key:
+                raise RuntimeError("Missing DEEPSEEK_API_KEY. Set it in .env or pass api_key.")
+            self._cloud_client = OpenAI(
+                api_key=key,
+                base_url=(base_url or DEEPSEEK_BASE_URL).rstrip("/"),
+                max_retries=0,
+            )
 
     def model_for(self, role):
         return self.models.get(role)
 
-    # -- unified chat ---------------------------------------------------
+    @staticmethod
+    def _thinking_body(role=None):
+        # Control-plane calls use tiny bounded outputs and must not spend that
+        # budget on hidden reasoning. General generation follows the env switch.
+        thinking = "disabled" if role in _CONTROL_ROLES else DEEPSEEK_THINKING
+        return {"thinking": {"type": thinking}}
 
     def chat(self, role, messages, temperature=0.1, num_predict=400, timeout=None):
-        """Send messages to the active backend for a given role (sql/story/suggest/semi).
-
-        `timeout` is in seconds. If the call exceeds it, a TimeoutError is raised so
-        the caller can fall back to a fast template instead of waiting indefinitely.
-        Defaults: 30s for cloud, 60s for local (fast 1.5B coder on CPU).
-        """
         if timeout is None:
             if self.provider == "local" and role in ("story", "prescription"):
-                # Slow local model on CPU: generous default, but an explicit
-                # timeout passed by the caller always wins (no hidden hang).
                 timeout = 900
             else:
                 timeout = 30 if self.provider != "local" else 60
@@ -122,11 +122,11 @@ class LLMProvider:
         try:
             if self.provider == "local":
                 return self._chat_local(model, messages, temperature, num_predict, timeout)
-            return self._chat_cloud(model, messages, temperature, num_predict, timeout)
+            return self._chat_cloud(role, model, messages, temperature, num_predict, timeout)
         except TimeoutError:
             raise
         except Exception as exc:
-            logging.warning(f"LLMProvider.{self.provider} chat failed ({role}): {exc}")
+            logging.warning("LLMProvider.%s chat failed (%s): %s", self.provider, role, exc)
             raise
 
     def chat_structured(
@@ -141,15 +141,15 @@ class LLMProvider:
         timeout=None,
         reasoning_effort="low",
     ):
-        """Return schema-constrained JSON from the cloud provider.
+        """Return validated-JSON-ready content from DeepSeek JSON mode.
 
-        This path is intended for control-plane decisions such as semantic routing.
-        It uses Groq Structured Outputs with strict constrained decoding so routing
-        does not depend on fragile prompt-only JSON formatting. Reasoning is kept
-        out of the returned assistant content to minimise latency and parsing risk.
+        DeepSeek Chat Completions supports ``response_format={type: json_object}``.
+        ARIA still performs its own Pydantic/schema validation after generation, so
+        provider JSON mode is a formatting guarantee rather than a trust boundary.
         """
+        del reasoning_effort
         if self.provider != "cloud":
-            raise RuntimeError("Strict structured output is currently available only on the cloud provider.")
+            raise RuntimeError("Structured output is currently available only on the cloud provider.")
         if timeout is None:
             timeout = 20
         model = self.model_for(role)
@@ -158,24 +158,28 @@ class LLMProvider:
         if not isinstance(json_schema, dict) or json_schema.get("type") != "object":
             raise ValueError("json_schema must be a JSON Schema object definition.")
 
+        schema_text = json.dumps(json_schema, ensure_ascii=False, separators=(",", ":"))
+        structured_messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"Return only one valid JSON object named {schema_name}. "
+                    "It must match this JSON Schema exactly. Do not use markdown fences, commentary, or extra keys. "
+                    f"JSON Schema: {schema_text}"
+                ),
+            },
+            *messages,
+        ]
         try:
             completion = self._cloud_with_retry(
-                lambda: self._groq_client.chat.completions.create(
+                lambda: self._cloud_client.chat.completions.create(
                     model=model,
-                    messages=messages,
+                    messages=structured_messages,
                     temperature=temperature,
                     max_tokens=num_predict,
                     timeout=timeout,
-                    reasoning_effort=reasoning_effort,
-                    include_reasoning=False,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": schema_name,
-                            "strict": True,
-                            "schema": json_schema,
-                        },
-                    },
+                    response_format={"type": "json_object"},
+                    extra_body={"thinking": {"type": "disabled"}},
                 )
             )
             content = completion.choices[0].message.content
@@ -185,16 +189,10 @@ class LLMProvider:
         except TimeoutError:
             raise
         except Exception as exc:
-            logging.warning(f"LLMProvider.{self.provider} structured chat failed ({role}): {exc}")
+            logging.warning("LLMProvider.%s structured chat failed (%s): %s", self.provider, role, exc)
             raise
 
     def complete(self, role, prompt, temperature=0.1, num_predict=400, timeout=None):
-        """Generate a raw completion for `prompt`.
-
-        Used for completion-only models (e.g. sqlcoder locally, which has no chat
-        template and just echoes the prompt when driven through `chat()`). For the
-        cloud backend the prompt is sent as a single user message.
-        """
         if timeout is None:
             if self.provider == "local" and role == "sql":
                 timeout = 900
@@ -208,19 +206,21 @@ class LLMProvider:
             if self.provider == "local":
                 return self._complete_local(model, prompt, temperature, num_predict, timeout)
             completion = self._cloud_with_retry(
-                lambda: self._groq_client.chat.completions.create(
+                lambda: self._cloud_client.chat.completions.create(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temperature,
                     max_tokens=num_predict,
                     timeout=timeout,
+                    extra_body=self._thinking_body(role),
                 )
             )
-            return completion.choices[0].message.content.strip()
+            content = completion.choices[0].message.content
+            return (content or "").strip()
         except TimeoutError:
             raise
         except Exception as exc:
-            logging.warning(f"LLMProvider.{self.provider} complete failed ({role}): {exc}")
+            logging.warning("LLMProvider.%s complete failed (%s): %s", self.provider, role, exc)
             raise
 
     def _complete_local(self, model, prompt, temperature, num_predict, timeout):
@@ -252,27 +252,46 @@ class LLMProvider:
         )
         return response["message"]["content"].strip()
 
-    def _chat_cloud(self, model, messages, temperature, num_predict, timeout):
+    def _chat_cloud(self, role, model, messages, temperature, num_predict, timeout):
         completion = self._cloud_with_retry(
-            lambda: self._groq_client.chat.completions.create(
+            lambda: self._cloud_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=temperature,
                 max_tokens=num_predict,
                 timeout=timeout,
+                extra_body=self._thinking_body(role),
             )
         )
-        return completion.choices[0].message.content.strip()
+        content = completion.choices[0].message.content
+        if not content:
+            raise RuntimeError("Cloud LLM response was empty.")
+        return content.strip()
 
-    def _cloud_with_retry(self, fn, attempts=3):
-        """Call `fn` (a Groq request) with a bounded retry for rate limits.
+    @staticmethod
+    def _retry_after_seconds(exc):
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            try:
+                raw = headers.get("retry-after") or headers.get("Retry-After")
+                if raw is not None and float(raw) > 0:
+                    return float(raw)
+            except (TypeError, ValueError):
+                pass
+        match = _RETRY_AFTER_RE.search(str(exc))
+        if match:
+            try:
+                value = float(match.group(1))
+                return value if value > 0 else None
+            except (TypeError, ValueError):
+                pass
+        return None
 
-        Both clients are configured/used with retries disabled so a 429 never
-        blocks on the SDK's own long retry-after backoff. Here we wait only a
-        short, capped delay and give up after a few attempts, raising the last
-        error so callers fall back to templates instead of hanging on the request.
-        """
+    def _cloud_with_retry(self, fn, attempts=4):
+        """Bounded retry for hosted-provider rate limits."""
         last_exc = None
+        attempts = max(1, int(attempts))
         for attempt in range(attempts):
             try:
                 return fn()
@@ -284,55 +303,50 @@ class LLMProvider:
                     status = getattr(response, "status_code", None)
                 if status != 429 or attempt >= attempts - 1:
                     raise
-                wait = 1.5
-                try:
-                    retry_after = float(response.headers.get("retry-after", 0))  # type: ignore[union-attr]
-                    if retry_after > 0:
-                        wait = min(retry_after, 5.0)
-                except Exception:
-                    pass
-                logging.warning("Rate limit (429); retrying in %.1fs (attempt %d/%d)",
-                                wait, attempt + 1, attempts)
+                hinted = self._retry_after_seconds(exc)
+                wait = min(max((hinted + 0.5) if hinted else 1.5 * (2**attempt), 1.5), 20.0)
+                logging.warning(
+                    "Rate limit (429); retrying in %.1fs (attempt %d/%d)",
+                    wait,
+                    attempt + 1,
+                    attempts,
+                )
                 time.sleep(wait)
         raise last_exc  # pragma: no cover
 
     def vision(self, prompt, images, temperature=0.1, num_predict=1500, timeout=60):
-        """Send rendered page images (base64 PNG strings) plus a text prompt to a
-        vision model. Available on the cloud (Groq) backend.
-
-        Used to transcribe scanned/handwritten PDFs into structured records.
-        """
+        """Send rendered page images to the hosted DeepSeek vision model."""
         model = self.models.get("vision")
         if not model:
             raise RuntimeError(f"No vision model configured for provider '{self.provider}'.")
         if self.provider == "local":
             raise RuntimeError(
-                "Handwritten/scanned PDF extraction requires the hosted Cloud "
-                "(Groq) provider with a vision model. Switch backend and retry."
+                "Handwritten/scanned PDF extraction requires the hosted Cloud (DeepSeek) provider."
             )
         content = [{"type": "text", "text": prompt}]
         for b64 in images:
             content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
-        try:
-            return self._vision_once(prompt, images, content, model, temperature, num_predict, timeout)
-        except TimeoutError:
-            raise
+        return self._vision_once(prompt, content, model, temperature, num_predict, timeout)
 
-    def _vision_once(self, prompt, images, content, model, temperature, num_predict, timeout):
+    def _vision_once(self, prompt, content, model, temperature, num_predict, timeout):
         kwargs = {}
-        if model.startswith("qwen/"):
+        if "json" in (prompt or "").lower():
             kwargs["response_format"] = {"type": "json_object"}
         completion = self._cloud_with_retry(
-            lambda: self._groq_client.chat.completions.create(
+            lambda: self._cloud_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": content}],
                 temperature=temperature,
                 max_tokens=num_predict,
                 timeout=timeout,
+                extra_body={"thinking": {"type": "disabled"}},
                 **kwargs,
             )
         )
-        return completion.choices[0].message.content.strip()
+        content_text = completion.choices[0].message.content
+        if not content_text:
+            raise RuntimeError("Vision response was empty.")
+        return content_text.strip()
 
     def __repr__(self):
         return f"LLMProvider(provider={self.provider}, models={self.models})"
@@ -342,22 +356,16 @@ class LLMProvider:
 # Convenience helpers
 # ---------------------------------------------------------------------------
 def create_provider(provider="local", api_key=None, models=None, base_url=None):
-    """Build an LLMProvider.
-
-    Policy: never silently switch backend. If the hosted provider ('cloud') is
-    requested but its dependencies/key are missing, raise so the caller/user
-    decides (no silent downgrade to local). Switching provider mid-session only
-    happens through an explicit user action (see /api/provider/switch) — never
-    automatically.
-    """
+    """Build an LLMProvider without silently switching backends."""
     if provider == "cloud":
-        if not GROQ_AVAILABLE:
+        if not DEEPSEEK_AVAILABLE:
             raise RuntimeError(
-                "The Cloud provider is unavailable because the 'groq' package is not "
-                "installed (pip install groq). Stay on Local or fix this first."
+                "The Cloud provider requires the OpenAI-compatible client package. Run: pip install openai"
             )
-        llm = LLMProvider("cloud", api_key=api_key or os.getenv("GROQ_API_KEY"), models=models)
-        if not llm._groq_client.api_key:
-            raise RuntimeError("Missing GROQ_API_KEY. Set it in .env or pass api_key.")
-        return llm
+        return LLMProvider(
+            "cloud",
+            api_key=api_key or os.getenv("DEEPSEEK_API_KEY"),
+            models=models,
+            base_url=base_url or os.getenv("DEEPSEEK_BASE_URL") or DEEPSEEK_BASE_URL,
+        )
     return LLMProvider("local", models=models)

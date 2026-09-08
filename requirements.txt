@@ -13,7 +13,7 @@ pandas
 numpy
 sqlalchemy
 ollama
-groq
+openai>=1.0
 fastapi
 uvicorn
 python-multipart
