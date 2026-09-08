@@ -1,20 +1,17 @@
 """Final response-quality layer for ARIA Insight PDF-RAG.
 
-The lower layers already handle intent routing, context planning, adaptive
-retrieval, evidence gates, conversation actions, and graceful failures.  This
-last layer enforces a clean user-facing contract: only citations actually used
-in the answer are shown, fabricated source labels are removed, and grounded
-answers expose compact diagnostics for evaluation without leaking internals to
-normal prose.
+The lower layers handle routing, context planning, adaptive retrieval, evidence
+gates, conversation actions and graceful failures. This layer enforces the
+user-facing citation contract and adds an auditable grounding-quality index.
 """
 
 from __future__ import annotations
 
 import re
 
-from .grounding import REFUSAL, citation_integrity
-
 from .conversation_layer import InsightPDFRAG as ConversationalInsightPDFRAG
+from .enterprise_quality import grounding_quality
+from .grounding import REFUSAL, citation_integrity
 
 
 _CITATION_RE = re.compile(r"\[(S\d+)\]", re.IGNORECASE)
@@ -28,10 +25,10 @@ class InsightPDFRAG(ConversationalInsightPDFRAG):
         """Return citation-safe answer and only the sources the answer references.
 
         LLMs can occasionally emit a source label that was not in the supplied
-        context.  Never surface such a label as if it were real evidence.
-        When the answer contains valid labels, hide unrelated retrieved chunks so
-        the UI stays concise.  If the model omits labels entirely, retain at most
-        four retrieved sources for transparency rather than inventing a citation.
+        context. Never surface such a label as if it were real evidence. When the
+        answer contains valid labels, hide unrelated retrieved chunks so the UI
+        stays concise. If the model omits labels entirely, retain at most four
+        retrieved sources for transparency rather than inventing a citation.
         """
         if not sources:
             cleaned = _CITATION_RE.sub("", answer or "").strip()
@@ -59,8 +56,8 @@ class InsightPDFRAG(ConversationalInsightPDFRAG):
             filtered = [by_id[source_id] for source_id in valid_cited]
             return cleaned, filtered, "cited"
 
-        # Do not invent source markers.  Keep a small evidence list so the user
-        # can still inspect where the grounded answer came from.
+        # Do not invent source markers. Keep a small evidence list so the user can
+        # still inspect where the grounded answer came from.
         return cleaned, sources[:4], "evidence_available_uncited"
 
     def finalize_result(self, result: dict) -> dict:
@@ -82,13 +79,28 @@ class InsightPDFRAG(ConversationalInsightPDFRAG):
                 result["answer"] = answer
         elif evidence_status in {"model_unavailable", "verification_failed", "verification_unavailable"}:
             sources = []
+
         result["sources"] = sources
+        result["retrieved_chunks"] = len(sources)
         result["citation_status"] = citation_status
+
+        context_plan = dict(result.get("context_plan") or {})
+        quality = grounding_quality(
+            evidence_status=str(result.get("evidence_status") or ""),
+            citation_status=citation_status,
+            sources=sources,
+            requested_document_ids=list(result.get("document_ids") or []),
+            cross_document=bool(context_plan.get("cross_document")),
+        )
+        result["grounding_quality"] = quality
         result["grounding"] = {
             "intent": intent,
             "evidence_status": result.get("evidence_status"),
             "citation_status": citation_status,
             "used_pdf_evidence": bool(sources),
             "retrieval": result.get("retrieval") or "not_used",
+            "quality_level": quality.get("level"),
+            "quality_score": quality.get("score"),
+            "quality_is_calibrated_probability": False,
         }
         return result

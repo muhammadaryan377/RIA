@@ -1,4 +1,4 @@
-"""Dependency-free BM25 and stable chunk identity for bounded PDF retrieval."""
+"""Dependency-free lexical retrieval, RRF fusion and provenance signals."""
 
 from __future__ import annotations
 
@@ -27,15 +27,52 @@ def deduplicate_chunks(documents: list[Document]) -> list[Document]:
     return list(unique.values())
 
 
+def _annotate_retrieval(doc: Document, **values) -> Document:
+    """Attach request-local provenance without replacing the Document object.
+
+    Existing orchestration and tests rely on stable chunk object identity. The
+    retrieval Documents are request-local/load-local objects, so metadata can be
+    safely enriched in place while preserving that identity contract.
+    """
+    doc.metadata.update(values)
+    return doc
+
+
 def fuse_ranked_lists(rankings: list[list[Document]]) -> list[Document]:
-    """RRF across subqueries so duplicate hits cannot consume reranker slots."""
-    scores, documents = {}, {}
-    for ranking in rankings:
+    """RRF across subqueries with auditable consensus metadata.
+
+    ``retrieval_votes`` counts independent ranked lists that returned a chunk and
+    ``retrieval_query_count`` is the denominator. This allows monitoring to
+    compare single-query and decomposed-query requests without inflating scores.
+    """
+    scores: dict[str, float] = {}
+    documents: dict[str, Document] = {}
+    ranks: dict[str, list[int]] = {}
+    active_rankings = [ranking for ranking in rankings if ranking]
+    query_count = max(1, len(active_rankings))
+    for ranking in active_rankings:
+        seen_in_ranking: set[str] = set()
         for rank, doc in enumerate(deduplicate_chunks(ranking), start=1):
             key = chunk_key(doc)
             documents.setdefault(key, doc)
             scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
-    return [documents[key] for key in sorted(scores, key=scores.get, reverse=True)]
+            if key not in seen_in_ranking:
+                ranks.setdefault(key, []).append(rank)
+                seen_in_ranking.add(key)
+
+    ordered = sorted(scores, key=lambda key: (-scores[key], key))
+    result: list[Document] = []
+    for key in ordered:
+        result.append(
+            _annotate_retrieval(
+                documents[key],
+                retrieval_votes=len(ranks.get(key, [])),
+                retrieval_query_count=query_count,
+                retrieval_rrf_score=round(scores[key], 8),
+                retrieval_subquery_ranks=list(ranks.get(key, [])),
+            )
+        )
+    return result
 
 
 def terms(text: str) -> list[str]:
@@ -48,9 +85,12 @@ def bm25_search(query: str, documents: list[Document], *, limit: int) -> list[Do
 
     The corpus must already be restricted to the authenticated user's active
     documents. Index construction is request-local; no stale cross-user cache.
+    Returned chunks include their BM25 score/rank for diagnostics and source
+    provenance; the score is not treated as a calibrated relevance probability.
     """
     documents = deduplicate_chunks(documents)
-    if not documents or not terms(query):
+    query_terms = terms(query)
+    if not documents or not query_terms:
         return []
     counts = [Counter(terms(doc.page_content)) for doc in documents]
     lengths = [sum(count.values()) for count in counts]
@@ -59,7 +99,7 @@ def bm25_search(query: str, documents: list[Document], *, limit: int) -> list[Do
     scores = []
     for index, count in enumerate(counts):
         score = 0.0
-        for term in set(terms(query)):
+        for term in set(query_terms):
             tf = count.get(term, 0)
             if not tf:
                 continue
@@ -68,4 +108,13 @@ def bm25_search(query: str, documents: list[Document], *, limit: int) -> list[Do
         if score > 0:
             scores.append((score, index))
     scores.sort(key=lambda item: (-item[0], item[1]))
-    return [documents[index] for _, index in scores[:max(0, limit)]]
+    result: list[Document] = []
+    for rank, (score, index) in enumerate(scores[:max(0, limit)], start=1):
+        result.append(
+            _annotate_retrieval(
+                documents[index],
+                retrieval_bm25_score=round(score, 8),
+                retrieval_bm25_rank=rank,
+            )
+        )
+    return result

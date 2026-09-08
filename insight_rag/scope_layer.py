@@ -1,34 +1,36 @@
 """Enterprise bounded-assistant orchestration for ARIA Insight PDF-RAG.
 
 All high-level language understanding is performed by ``SemanticRouter`` using a
-validated schema. This layer enforces the product boundary:
-- normal conversation is allowed but cannot become factual world-knowledge QA;
-- ARIA/system questions are answered only from the runtime profile;
-- document questions execute grounded PDF plans;
-- unrelated factual requests are declined;
-- ambiguous requests ask for clarification instead of guessing.
+validated schema. This layer enforces the product boundary, tenant/document
+scope, request limits, privacy-safe observability and final response persistence.
 """
 
 from __future__ import annotations
 
-import uuid
 import time
+import uuid
 from contextvars import ContextVar
 
-_ACTIVE_ROUTE = ContextVar("aria_active_route", default=None)
-
-from .diagnostics import TRACE
-from .config import RAG_LLM_MODEL
+from .config import (
+    MAX_SELECTED_DOCUMENTS,
+    RAG_LLM_MODEL,
+    RAG_PIPELINE_VERSION,
+    validate_rag_config,
+)
 from .context_engine import ContextPlan
+from .diagnostics import TRACE, record, stage
 from .final_layer import InsightPDFRAG as FinalInsightPDFRAG
 from .runtime_profile import build_runtime_profile
 from .semantic_router import RouteDecision, SemanticRouter
+
+_ACTIVE_ROUTE = ContextVar("aria_active_route", default=None)
 
 
 class InsightPDFRAG(FinalInsightPDFRAG):
     """Production export: semantic routing + grounded document intelligence."""
 
     def __init__(self, *, insight_agent, user_id: str | int):
+        validate_rag_config()
         super().__init__(insight_agent=insight_agent, user_id=user_id)
         self.semantic_router = SemanticRouter(self.llm)
         self.runtime_profile = build_runtime_profile(insight_agent)
@@ -67,11 +69,13 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             return "No PDFs are currently uploaded/indexed for this user."
         lines = [f"Uploaded/indexed PDFs: {len(documents)}"]
         for index, document in enumerate(documents[:20], start=1):
+            quality = (document.get("ingestion_quality") or {}).get("grade")
+            quality_note = f", extraction quality {quality}" if quality else ""
             lines.append(
                 f"{index}. {document.get('filename') or 'Untitled PDF'} "
                 f"({int(document.get('pages', 0) or 0)} pages, "
                 f"{int(document.get('tables', 0) or 0)} tables, "
-                f"{int(document.get('total_chunks', 0) or 0)} chunks)"
+                f"{int(document.get('total_chunks', 0) or 0)} chunks{quality_note})"
             )
         if len(documents) > 20:
             lines.append(f"...and {len(documents) - 20} more PDFs")
@@ -99,13 +103,14 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             },
         ]
         try:
-            return self.llm.chat(
-                "rag",
-                messages,
-                temperature=0.03,
-                num_predict=600,
-                timeout=20,
-            ).strip()
+            with stage("system_answer"):
+                return self.llm.chat(
+                    "rag",
+                    messages,
+                    temperature=0.03,
+                    num_predict=600,
+                    timeout=20,
+                ).strip()
         except Exception:
             return (
                 "I can explain ARIA and this Insight Agent from its runtime configuration, "
@@ -142,13 +147,14 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             },
         ]
         try:
-            return self.llm.chat(
-                "rag",
-                messages,
-                temperature=0.20,
-                num_predict=180,
-                timeout=12,
-            ).strip()
+            with stage("conversation_answer"):
+                return self.llm.chat(
+                    "rag",
+                    messages,
+                    temperature=0.20,
+                    num_predict=180,
+                    timeout=12,
+                ).strip()
         except Exception:
             if documents:
                 count = len(documents)
@@ -161,6 +167,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         result["scope"] = decision.scope
         result["routing"] = decision.as_dict()
         result["request_id"] = request_id
+        result["pipeline_version"] = RAG_PIPELINE_VERSION
         grounding = result.setdefault("grounding", {})
         grounding.setdefault("scope", decision.scope)
         grounding.setdefault("route_task", decision.task)
@@ -181,24 +188,29 @@ class InsightPDFRAG(FinalInsightPDFRAG):
 
         conversation_id = conversation_id or uuid.uuid4().hex
         request_id = uuid.uuid4().hex
+        record("request_id", request_id)
         history = self.conversations.load_recent(conversation_id).get("messages", [])
         documents = self.metadata.list_documents()
-        decision = self.semantic_router.decide(
-            question,
-            history=history,
-            documents=documents,
-            selected_document_ids=document_ids,
-        )
-        routing = self._routing_payload(decision)
+        with stage("semantic_router"):
+            decision = self.semantic_router.decide(
+                question,
+                history=history,
+                documents=documents,
+                selected_document_ids=document_ids,
+            )
+        record("route_scope", decision.scope)
+        record("route_task", decision.task)
+        record("router_confidence", round(float(decision.confidence or 0.0), 4))
 
         if decision.scope == "DOCUMENT":
             token = _ACTIVE_ROUTE.set(decision)
             try:
-                result = super().chat(
-                    question,
-                    conversation_id=conversation_id,
-                    document_ids=document_ids,
-                )
+                with stage("document_execution"):
+                    result = super().chat(
+                        question,
+                        conversation_id=conversation_id,
+                        document_ids=document_ids,
+                    )
             finally:
                 _ACTIVE_ROUTE.reset(token)
             return self._decorate_result(result, decision, request_id)
@@ -215,13 +227,14 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                     intent="clarification", evidence_status="scope_changed",
                 )
                 return self._decorate_result(result, decision, request_id)
-            result = self.handle_previous_answer(
-                question,
-                conversation_id=conversation_id,
-                history=history,
-                action=decision.previous_action,
-                transform_instruction=decision.transform_instruction,
-            )
+            with stage("previous_answer_action"):
+                result = self.handle_previous_answer(
+                    question,
+                    conversation_id=conversation_id,
+                    history=history,
+                    action=decision.previous_action,
+                    transform_instruction=decision.transform_instruction,
+                )
             return self._decorate_result(result, decision, request_id)
 
         if decision.scope == "SYSTEM":
@@ -273,32 +286,56 @@ class InsightPDFRAG(FinalInsightPDFRAG):
 
     def chat(self, question: str, *, conversation_id: str | None = None,
              document_ids: list[str] | None = None) -> dict:
-        """Serialize one conversation, then persist exactly the visible response."""
+        """Serialize one conversation, enforce scope limits, and persist one visible response."""
         conversation_id = conversation_id or uuid.uuid4().hex
+        if len(conversation_id) > 128:
+            raise ValueError("Conversation id is too long.")
+
+        if document_ids:
+            document_ids = list(dict.fromkeys(str(value) for value in document_ids if str(value)))
+            if len(document_ids) > MAX_SELECTED_DOCUMENTS:
+                raise ValueError(
+                    f"Select at most {MAX_SELECTED_DOCUMENTS} PDFs for one request. Narrow the selection and try again."
+                )
+
         started = time.perf_counter()
-        token = TRACE.set({})
+        token = TRACE.set({"pipeline_version": RAG_PIPELINE_VERSION})
         try:
             with self.conversations.turn_lock(conversation_id):
                 if document_ids:
                     owned = {str(doc.get("document_id")) for doc in self.metadata.list_documents()}
                     if any(str(did) not in owned for did in document_ids):
                         raise ValueError("One or more selected PDFs are unavailable. Refresh the document list.")
-                result = self.finalize_result(self._chat(
-                    question, conversation_id=conversation_id, document_ids=document_ids,
-                ))
+
+                with stage("orchestration"):
+                    raw_result = self._chat(
+                        question, conversation_id=conversation_id, document_ids=document_ids,
+                    )
+                with stage("finalize_response"):
+                    result = self.finalize_result(raw_result)
+
                 owned_now = {str(doc.get("document_id")) for doc in self.metadata.list_documents()}
                 if any(str(source.get("document_id")) not in owned_now for source in result.get("sources", [])):
-                    result.update(answer="A source PDF was removed during this request. Please ask again using the available PDFs.",
-                                  sources=[], evidence_status="scope_changed")
-                    result = self.finalize_result(result)
-                result["diagnostics"] = dict(TRACE.get() or {})
-                self._remember(
-                    conversation_id, result["question"], result["answer"],
-                    intent=result["intent"], sources=result.get("sources", []),
-                    document_ids=result.get("document_ids", []),
-                    search_query=result.get("search_query"), routing=result.get("routing"),
-                )
+                    result.update(
+                        answer="A source PDF was removed during this request. Please ask again using the available PDFs.",
+                        sources=[], evidence_status="scope_changed",
+                    )
+                    with stage("finalize_scope_change"):
+                        result = self.finalize_result(result)
+
+                with stage("conversation_persist"):
+                    self._remember(
+                        conversation_id, result["question"], result["answer"],
+                        intent=result["intent"], sources=result.get("sources", []),
+                        document_ids=result.get("document_ids", []),
+                        search_query=result.get("search_query"), routing=result.get("routing"),
+                    )
+
                 result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+                trace = dict(TRACE.get() or {})
+                trace["total_latency_ms"] = result["latency_ms"]
+                result["diagnostics"] = trace
+                result["pipeline_version"] = RAG_PIPELINE_VERSION
                 return result
         finally:
             TRACE.reset(token)

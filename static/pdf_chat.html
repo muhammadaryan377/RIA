@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>ARIA — Insight PDF Chat</title>
 <style>
-  :root { --bg:#0f172a; --panel:#1e293b; --panel2:#334155; --border:#475569; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --ok:#34d399; }
+  :root { --bg:#0f172a; --panel:#1e293b; --panel2:#334155; --border:#475569; --text:#e2e8f0; --muted:#94a3b8; --accent:#38bdf8; --ok:#34d399; --warn:#fbbf24; }
   * { box-sizing:border-box; }
   body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
   header { padding:18px 26px; background:var(--panel); border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; gap:12px; }
@@ -26,6 +26,8 @@
   .doc input { width:auto; margin-top:3px; }
   .doc-name { font-size:13px; font-weight:700; word-break:break-word; }
   .doc-meta { color:var(--muted); font-size:11px; margin-top:3px; }
+  .doc-quality { margin-top:5px; font-size:10px; text-transform:uppercase; letter-spacing:.04em; }
+  .quality-high { color:var(--ok); } .quality-medium { color:var(--warn); } .quality-low { color:#f87171; }
   .doc-actions { margin-top:7px; }
   .doc-actions button { padding:4px 8px; font-size:11px; }
   .chat { min-height:560px; display:flex; flex-direction:column; }
@@ -46,10 +48,10 @@
 <header>
   <div>
     <h1>ARIA — Insight Agent PDF Chat</h1>
-    <p style="margin:4px 0 0">Context-aware chat · grounded PDF answers · text PDFs + tables · LangChain · local BGE embeddings · adaptive hybrid retrieval · DeepSeek V4 Flash</p>
+    <p style="margin:4px 0 0">Enterprise RAG · semantic routing · hybrid retrieval · reranking · fail-closed grounding · source provenance · DeepSeek V4 Flash</p>
   </div>
   <div>
-    <span class="pill">RAG is part of Insight Agent</span>
+    <span class="pill" id="pipeline_badge">Insight Agent RAG</span>
     <button class="secondary" onclick="location.href='/'" style="margin-left:8px">Main ARIA</button>
   </div>
 </header>
@@ -65,7 +67,7 @@
 
     <section class="panel" style="margin-top:16px">
       <h2>Your Documents</h2>
-      <p style="margin-top:0">Select the PDFs ARIA should search. Normal conversation and document-list questions work without retrieval.</p>
+      <p style="margin-top:0">Select the PDFs ARIA should search. Extraction quality is shown for newly indexed enterprise-v2 documents.</p>
       <div id="documents"></div>
       <button class="secondary" onclick="loadDocuments()">Refresh</button>
     </section>
@@ -77,7 +79,7 @@
       <button class="secondary" onclick="newConversation()">New conversation</button>
     </div>
     <div class="status" id="chat_status">Say hello, ask how many PDFs you have, find exact text, or ask a grounded question.</div>
-    <div class="examples">Examples: “How many PDFs do I have?” · “Find ‘data science lifecycle’” · “Summarize page 4” · “Compare both PDFs” · “Make that shorter” · “Where did you find that?”</div>
+    <div class="examples">Examples: “How many PDFs do I have?” · “Find ‘data science lifecycle’” · “Summarize page 4” · “Compare both PDFs” · “Explain that simply” · “Where did you find that?”</div>
     <div id="messages"></div>
     <div class="composer">
       <textarea id="question" placeholder="Chat normally or ask about your PDF(s)…" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();askPdf();}"></textarea>
@@ -109,9 +111,21 @@ async function api(path, options={}) {
   if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
   return data;
 }
+function qualityLabel(doc) {
+  const q = doc.ingestion_quality || {};
+  if (!q.grade) return '';
+  const warnings = Array.isArray(q.warnings) ? q.warnings.length : 0;
+  const coverage = Number(q.text_page_coverage || 0) * 100;
+  return `<div class="doc-quality quality-${esc(q.grade)}">Extraction ${esc(q.grade)} · ${coverage.toFixed(0)}% text-page coverage${warnings ? ` · ${warnings} warning${warnings===1?'':'s'}` : ''}</div>`;
+}
 async function loadDocuments() {
   if (!TOKEN) { status('upload_status','Please sign in from the main ARIA page first.',false); return; }
-  try { const data = await api('/api/insight/pdf/documents'); documentCache = data.documents || []; renderDocuments(); }
+  try {
+    const data = await api('/api/insight/pdf/documents');
+    documentCache = data.documents || [];
+    if (data.pipeline_version) $('pipeline_badge').textContent = `RAG ${data.pipeline_version}`;
+    renderDocuments();
+  }
   catch (e) { status('upload_status',e.message,false); }
 }
 function renderDocuments() {
@@ -121,7 +135,7 @@ function renderDocuments() {
     <div class="doc">
       <div class="doc-top">
         <input class="doc-check" type="checkbox" value="${esc(doc.document_id)}" checked />
-        <div><div class="doc-name">${esc(doc.filename)}</div><div class="doc-meta">${doc.pages||0} pages · ${doc.tables||0} tables · ${doc.total_chunks||0} chunks</div></div>
+        <div><div class="doc-name">${esc(doc.filename)}</div><div class="doc-meta">${doc.pages||0} pages · ${doc.tables||0} tables · ${doc.total_chunks||0} chunks</div>${qualityLabel(doc)}</div>
       </div>
       <div class="doc-actions"><button class="danger" onclick="deletePdf('${esc(doc.document_id)}')">Delete</button></div>
     </div>`).join('');
@@ -130,11 +144,12 @@ async function uploadPdf() {
   const input = $('pdf_file');
   if (!input.files.length) { status('upload_status','Choose a PDF first.',false); return; }
   const form = new FormData(); form.append('file', input.files[0]);
-  status('upload_status','Extracting text/tables and creating local embeddings…');
+  status('upload_status','Extracting text/tables, checking extraction quality, and indexing evidence…');
   try {
     const data = await api('/api/insight/pdf/upload',{method:'POST',body:form});
-    const d = data.document || {};
-    status('upload_status', data.duplicate ? `Already indexed: ${d.filename}` : `Indexed ${d.filename}: ${d.pages} pages, ${d.tables} tables, ${d.total_chunks} chunks.`, true);
+    const d = data.document || {}; const q = d.ingestion_quality || {};
+    const quality = q.grade ? ` Extraction quality: ${q.grade}.` : '';
+    status('upload_status', data.duplicate ? `Already indexed: ${d.filename}` : `Indexed ${d.filename}: ${d.pages} pages, ${d.tables} tables, ${d.total_chunks} chunks.${quality}`, true);
     input.value=''; await loadDocuments();
   } catch(e) { status('upload_status',e.message,false); }
 }
@@ -152,20 +167,26 @@ function addMessage(role, text, sources=[]) {
 function updateChatStatus(data) {
   const noRetrieval = ['smalltalk','capability','document_inventory','document_metadata','clarification'];
   const conversationAction = String(data.intent||'').startsWith('conversation_');
+  const quality = data.grounding_quality || {};
+  const qualityText = quality.level && quality.level !== 'none' ? ` · grounding ${quality.level} (${Number(quality.score||0).toFixed(2)})` : '';
+  const latencyText = data.latency_ms ? ` · ${Math.round(data.latency_ms)} ms` : '';
+  if (data.pipeline_version) $('pipeline_badge').textContent = `RAG ${data.pipeline_version}`;
   if (conversationAction) {
-    status('chat_status','Previous-answer context used · no new PDF retrieval needed',true);
+    status('chat_status',`Previous-answer context used · no new PDF retrieval needed${qualityText}${latencyText}`,true);
   } else if (noRetrieval.includes(data.intent)) {
-    status('chat_status', data.intent === 'clarification' ? 'I need one detail before I search.' : 'Context-aware response · no PDF retrieval needed', true);
+    status('chat_status', (data.intent === 'clarification' ? 'I need one detail before I search.' : 'Context-aware response · no PDF retrieval needed') + latencyText, true);
   } else if (data.retrieval === 'exact_text') {
-    status('chat_status', `${data.retrieved_chunks||0} exact match source${(data.retrieved_chunks||0)===1?'':'s'}`, true);
+    status('chat_status', `${data.retrieved_chunks||0} exact match source${(data.retrieved_chunks||0)===1?'':'s'}${qualityText}${latencyText}`, true);
   } else if (data.evidence_status === 'no_documents') {
     status('chat_status','Upload a PDF when you want to ask document questions.',false);
   } else if (data.evidence_status === 'insufficient') {
-    status('chat_status','No supporting evidence found in the selected PDF.',true);
+    status('chat_status',`No supporting evidence found in the selected PDF.${latencyText}`,true);
+  } else if (data.evidence_status === 'verification_failed' || data.evidence_status === 'verification_unavailable') {
+    status('chat_status',`Grounding verification did not pass · answer withheld${latencyText}`,false);
   } else if (data.evidence_status === 'service_unavailable' || data.evidence_status === 'model_unavailable') {
     status('chat_status','Temporary service issue · your PDFs remain indexed',false);
   } else {
-    status('chat_status',`${data.retrieval||'adaptive hybrid'} · ${data.retrieved_chunks||0} evidence chunks · ${data.model||'local/direct'}`,true);
+    status('chat_status',`${data.retrieval||'adaptive hybrid'} · ${data.retrieved_chunks||0} cited evidence chunks · ${data.model||'local/direct'}${qualityText}${latencyText}`,true);
   }
 }
 async function askPdf() {

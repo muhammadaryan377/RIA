@@ -2,12 +2,13 @@ name: Insight Agent CI
 
 on:
   push:
-    branches: [main, insight-rag-pdf-v1, improve-rag-reliability]
+    branches: [main, insight-rag-pdf-v1, improve-rag-reliability, enterprise-rag-v2]
     paths:
       - "api/query_routes.py"
       - "api/insight_rag_routes.py"
       - "app.py"
       - "llm_provider.py"
+      - "rag_eval.py"
       - "insight_agent_advanced.py"
       - "insight_agent_industry.py"
       - "insight_extensions/**"
@@ -31,6 +32,7 @@ on:
       - "api/insight_rag_routes.py"
       - "app.py"
       - "llm_provider.py"
+      - "rag_eval.py"
       - "insight_agent_advanced.py"
       - "insight_agent_industry.py"
       - "insight_extensions/**"
@@ -75,6 +77,7 @@ jobs:
         run: |
           python -m py_compile app.py
           python -m py_compile llm_provider.py
+          python -m py_compile rag_eval.py
           python -m py_compile api/query_routes.py
           python -m py_compile api/insight_rag_routes.py
           python -m py_compile insight_agent_advanced.py
@@ -85,6 +88,9 @@ jobs:
           python -m py_compile insight_rag/config.py
           python -m py_compile insight_rag/context_engine.py
           python -m py_compile insight_rag/conversation_layer.py
+          python -m py_compile insight_rag/diagnostics.py
+          python -m py_compile insight_rag/enterprise_quality.py
+          python -m py_compile insight_rag/evaluation.py
           python -m py_compile insight_rag/evidence.py
           python -m py_compile insight_rag/final_layer.py
           python -m py_compile insight_rag/friendly.py
@@ -92,6 +98,7 @@ jobs:
           python -m py_compile insight_rag/pdf_ingest.py
           python -m py_compile insight_rag/presentation.py
           python -m py_compile insight_rag/provider_stability.py
+          python -m py_compile insight_rag/retrieval.py
           python -m py_compile insight_rag/reranker.py
           python -m py_compile insight_rag/runtime_profile.py
           python -m py_compile insight_rag/scope_layer.py
@@ -147,6 +154,7 @@ jobs:
               '/api/schema',
               '/api/ask',
               '/api/insight',
+              '/api/insight/pdf/health',
               '/api/insight/pdf/upload',
               '/api/insight/pdf/documents',
               '/api/insight/pdf/documents/{document_id}',
