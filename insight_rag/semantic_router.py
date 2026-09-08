@@ -114,6 +114,7 @@ class CompactRouterOutput(BaseModel):
     metadata_kind: MetadataKind = "NONE"
     previous_action: PreviousAction = "NONE"
     transform_instruction: str | None = None
+    needs_rewrite: bool = False
     reason: str = ""
 
 
@@ -328,6 +329,7 @@ class SemanticRouter:
             "target_pages": {"type": "array", "items": {"type": "integer"}},
             "search_term": {"type": ["string", "null"]},
             "exact_search": {"type": "boolean"},
+            "needs_rewrite": {"type": "boolean"},
             "metadata_kind": {
                 "type": "string",
                 "enum": ["NONE", "INVENTORY_COUNT", "INVENTORY_LIST", "PAGES", "TABLES", "CHUNKS", "NAME"],
@@ -429,6 +431,15 @@ class SemanticRouter:
             )
             reason = f"router confidence below threshold; {reason}"
 
+        if scope == "DOCUMENT" and any(key not in key_to_id for key in requested_keys):
+            needs_clarification = True
+            clarification = "I couldn't resolve the requested PDF. Please select it from the document list."
+        if scope == "CONVERSATION" and task == "PREVIOUS_ANSWER" and (
+            output.previous_action == "NONE" or output.confidence < ROUTER_MIN_CONFIDENCE
+        ):
+            needs_clarification = True
+            clarification = "What would you like me to do with the previous answer?"
+
         if scope == "DOCUMENT" and selected_set and resolved:
             selected_resolved = [document_id for document_id in resolved if document_id in selected_set]
             if not selected_resolved and task != "DOCUMENT_METADATA":
@@ -460,6 +471,10 @@ class SemanticRouter:
                     task = "CLARIFY"
                     clarification = clarification or "Which selected PDF should I use for that request?"
                     reason = f"document scope unresolved; {reason}"
+
+        if scope == "DOCUMENT" and task == "DOCUMENT_COMPARE" and len(resolved) < 2:
+            needs_clarification = True
+            clarification = "Please select at least two PDFs for a document comparison."
 
         if needs_clarification:
             scope = "CLARIFICATION"
@@ -570,6 +585,10 @@ class SemanticRouter:
             "Set broad_query for whole-document/section-wide synthesis. Set cross_document for multi-PDF evidence. "
             "Set needs_rewrite when the current turn depends on prior conversation. Set needs_query_decomposition for genuinely multi-part evidence requests. "
             "Set prefer_tables and table_operations only when deterministic table calculations/row reasoning are relevant. "
+            "When a previous assistant answer is present, 'explain that simply', 'make it shorter', "
+            "'isko asan karo' and equivalent requests are PREVIOUS_ANSWER/TRANSFORM, not CLARIFICATION. "
+            "'Where did you find that?' operates on the previous answer's sources (SOURCES). "
+            "A new date or metric such as 'and 2024?' needs DOCUMENT_QA with needs_rewrite=true. "
             "For previous-answer operations use previous_action=SOURCES, REPEAT or TRANSFORM; otherwise NONE. "
             "For numeric filters, encode table_filter_operator as GT/GTE/LT/LTE/EQ and table_filter_value as a number. "
             "Do not use world knowledge to answer or justify the user's factual question."
@@ -639,7 +658,7 @@ class SemanticRouter:
                 exact_search=compact.exact_search,
                 broad_query=compact.task == "DOCUMENT_SUMMARY",
                 cross_document=compact.task == "DOCUMENT_COMPARE",
-                needs_rewrite=False,
+                needs_rewrite=compact.needs_rewrite,
                 needs_query_decomposition=False,
                 prefer_tables=False,
                 previous_action=compact.previous_action,
@@ -722,13 +741,25 @@ class SemanticRouter:
             parsed = self._extract_json(raw)
             output = self._validate_rich(parsed)
             latency_ms = (time.perf_counter() - started) * 1000.0
-            return self._normalise(
-                output,
-                key_to_id=key_to_id,
-                selected_set=selected_set,
-                documents=documents,
-                latency_ms=latency_ms,
+            decision = self._normalise(
+                output, key_to_id=key_to_id, selected_set=selected_set,
+                documents=documents, latency_ms=latency_ms,
             )
+            if decision.scope == "CLARIFICATION" and any(item.get("role") == "assistant" for item in history):
+                # One bounded semantic repair. It can only rescue a previous-answer
+                # operation; it cannot turn clarification into new factual QA.
+                repaired = self._compact_fallback(
+                    question, messages=messages + [{"role": "system", "content": (
+                        "Check whether this request operates solely on the existing previous assistant answer. "
+                        "If yes use CONVERSATION/PREVIOUS_ANSWER with the correct action. "
+                        "If new facts or a genuinely ambiguous referent are needed, retain CLARIFICATION."
+                    )}], key_to_id=key_to_id, selected_set=selected_set,
+                    documents=documents, started=started,
+                    primary_error=ValueError("ambiguous previous-answer route"),
+                )
+                if repaired.scope == "CONVERSATION" and repaired.task == "PREVIOUS_ANSWER":
+                    return repaired
+            return decision
         except Exception as exc:
             return self._compact_fallback(
                 question,

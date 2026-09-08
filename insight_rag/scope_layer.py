@@ -12,7 +12,12 @@ validated schema. This layer enforces the product boundary:
 from __future__ import annotations
 
 import uuid
+import time
+from contextvars import ContextVar
 
+_ACTIVE_ROUTE = ContextVar("aria_active_route", default=None)
+
+from .diagnostics import TRACE
 from .config import RAG_LLM_MODEL
 from .context_engine import ContextPlan
 from .final_layer import InsightPDFRAG as FinalInsightPDFRAG
@@ -27,7 +32,6 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         super().__init__(insight_agent=insight_agent, user_id=user_id)
         self.semantic_router = SemanticRouter(self.llm)
         self.runtime_profile = build_runtime_profile(insight_agent)
-        self._active_route_decision: RouteDecision | None = None
 
     def _build_context_plan(
         self,
@@ -42,7 +46,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             history=history,
             documents=documents,
             selected_document_ids=selected_document_ids,
-            route_decision=self._active_route_decision,
+            route_decision=_ACTIVE_ROUTE.get(),
         )
 
     @staticmethod
@@ -162,7 +166,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         grounding.setdefault("route_task", decision.task)
         return result
 
-    def chat(
+    def _chat(
         self,
         question: str,
         *,
@@ -177,7 +181,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
 
         conversation_id = conversation_id or uuid.uuid4().hex
         request_id = uuid.uuid4().hex
-        history = self.conversations.load(conversation_id).get("messages", [])
+        history = self.conversations.load_recent(conversation_id).get("messages", [])
         documents = self.metadata.list_documents()
         decision = self.semantic_router.decide(
             question,
@@ -188,7 +192,7 @@ class InsightPDFRAG(FinalInsightPDFRAG):
         routing = self._routing_payload(decision)
 
         if decision.scope == "DOCUMENT":
-            self._active_route_decision = decision
+            token = _ACTIVE_ROUTE.set(decision)
             try:
                 result = super().chat(
                     question,
@@ -196,10 +200,21 @@ class InsightPDFRAG(FinalInsightPDFRAG):
                     document_ids=document_ids,
                 )
             finally:
-                self._active_route_decision = None
+                _ACTIVE_ROUTE.reset(token)
             return self._decorate_result(result, decision, request_id)
 
         if decision.scope == "CONVERSATION" and decision.task == "PREVIOUS_ANSWER":
+            previous = self._last_assistant_message(history) or {}
+            prior_ids = {str(source.get("document_id")) for source in previous.get("sources", [])}
+            owned = {str(doc.get("document_id")) for doc in documents}
+            permitted = owned & set(document_ids) if document_ids else owned
+            if prior_ids - permitted:
+                result = self._base_result(
+                    conversation_id=conversation_id, question=question,
+                    answer="The previous answer used a PDF that is no longer available or selected. Please select the relevant PDF and ask the question again.",
+                    intent="clarification", evidence_status="scope_changed",
+                )
+                return self._decorate_result(result, decision, request_id)
             result = self.handle_previous_answer(
                 question,
                 conversation_id=conversation_id,
@@ -228,14 +243,6 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             intent = "out_of_scope"
             model = None
 
-        self._remember(
-            conversation_id,
-            question,
-            answer,
-            intent=intent,
-            document_ids=[],
-            routing=routing,
-        )
         result = self._base_result(
             conversation_id=conversation_id,
             question=question,
@@ -263,3 +270,35 @@ class InsightPDFRAG(FinalInsightPDFRAG):
             "retrieval": "not_used",
         }
         return self._decorate_result(result, decision, request_id)
+
+    def chat(self, question: str, *, conversation_id: str | None = None,
+             document_ids: list[str] | None = None) -> dict:
+        """Serialize one conversation, then persist exactly the visible response."""
+        conversation_id = conversation_id or uuid.uuid4().hex
+        started = time.perf_counter()
+        token = TRACE.set({})
+        try:
+            with self.conversations.turn_lock(conversation_id):
+                if document_ids:
+                    owned = {str(doc.get("document_id")) for doc in self.metadata.list_documents()}
+                    if any(str(did) not in owned for did in document_ids):
+                        raise ValueError("One or more selected PDFs are unavailable. Refresh the document list.")
+                result = self.finalize_result(self._chat(
+                    question, conversation_id=conversation_id, document_ids=document_ids,
+                ))
+                owned_now = {str(doc.get("document_id")) for doc in self.metadata.list_documents()}
+                if any(str(source.get("document_id")) not in owned_now for source in result.get("sources", [])):
+                    result.update(answer="A source PDF was removed during this request. Please ask again using the available PDFs.",
+                                  sources=[], evidence_status="scope_changed")
+                    result = self.finalize_result(result)
+                result["diagnostics"] = dict(TRACE.get() or {})
+                self._remember(
+                    conversation_id, result["question"], result["answer"],
+                    intent=result["intent"], sources=result.get("sources", []),
+                    document_ids=result.get("document_ids", []),
+                    search_query=result.get("search_query"), routing=result.get("routing"),
+                )
+                result["latency_ms"] = round((time.perf_counter() - started) * 1000, 2)
+                return result
+        finally:
+            TRACE.reset(token)

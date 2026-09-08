@@ -7,10 +7,13 @@ explicit operations and performs only auditable pandas calculations.
 from __future__ import annotations
 
 import re
+import math
 from collections import defaultdict
 
 import pandas as pd
 from langchain_core.documents import Document
+
+from .retrieval import deduplicate_chunks
 
 
 def _split_markdown_row(line: str) -> list[str]:
@@ -29,14 +32,17 @@ def markdown_to_frame(text: str) -> pd.DataFrame | None:
     if len(lines) < 3:
         return None
     header = _split_markdown_row(lines[0])
-    if not header:
+    if not header or len(set(header)) != len(header):
+        return None
+    separator = _split_markdown_row(lines[1])
+    if len(separator) != len(header) or not all(re.fullmatch(r":?-{3,}:?", cell) for cell in separator):
         return None
     rows = []
     for line in lines[2:]:
         row = _split_markdown_row(line)
-        if len(row) < len(header):
-            row += [""] * (len(header) - len(row))
-        rows.append(row[: len(header)])
+        if len(row) != len(header):
+            return None
+        rows.append(row)
     if not rows:
         return None
     return pd.DataFrame(rows, columns=header)
@@ -50,11 +56,13 @@ def _to_number(value):
         return None
     negative = text.startswith("(") and text.endswith(")")
     text = text.strip("()")
-    text = re.sub(r"[$£€₹,%]", "", text)
+    text = re.sub(r"[$£€₹%]", "", text).strip()
+    if "," in text and not re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?", text):
+        return None
     text = text.replace(",", "").strip()
     try:
         number = float(text)
-        return -number if negative else number
+        return (-number if negative else number) if math.isfinite(number) else None
     except ValueError:
         return None
 
@@ -164,6 +172,7 @@ def build_table_facts(
     filter_operator: str = "NONE",
     filter_value: float | None = None,
     top_n: int | None = None,
+    sources: list[dict] | None = None,
 ) -> str:
     """Create deterministic facts from retrieved table rows.
 
@@ -175,7 +184,7 @@ def build_table_facts(
         return ""
 
     grouped: dict[tuple, list[Document]] = defaultdict(list)
-    for doc in docs:
+    for doc in deduplicate_chunks(docs):
         meta = doc.metadata
         if meta.get("content_type") != "table":
             continue
@@ -190,14 +199,25 @@ def build_table_facts(
     sections = []
     for key, table_docs in grouped.items():
         frames = []
+        table_docs.sort(key=lambda doc: doc.metadata.get("table_chunk_index", 0))
+        expected_counts = {doc.metadata.get("table_chunk_count") for doc in table_docs
+                           if doc.metadata.get("table_chunk_count") is not None}
+        complete = not expected_counts or (len(expected_counts) == 1 and
+                    {doc.metadata.get("table_chunk_index") for doc in table_docs} == set(range(next(iter(expected_counts)))))
+        if not complete:
+            sections.append(f"No calculation: incomplete table from {key[1]}, page {key[2]}, table {key[3]}.")
+            continue
+        malformed = False
         for doc in table_docs:
             frame = markdown_to_frame(doc.page_content)
             if frame is not None:
                 frames.append(frame)
-        if not frames:
+            else:
+                malformed = True
+        if malformed or not frames or any(list(f.columns) != list(frames[0].columns) for f in frames):
             continue
 
-        frame = pd.concat(frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
+        frame = pd.concat(frames, ignore_index=True).reset_index(drop=True)
         numeric = _numeric_series(frame)
         relevant_columns = _relevant_numeric_columns(question, numeric)
         if not relevant_columns:
@@ -206,14 +226,36 @@ def build_table_facts(
         label_columns = _label_columns(frame, set(numeric))
         filename, page, table_index = key[1], key[2], key[3]
         facts = []
+        has_total_row = any(
+            frame[column].astype(str).str.strip().str.casefold().isin(
+                {"total", "subtotal", "grand total", "sub-total"}
+            ).any() for column in label_columns
+        )
+        if has_total_row and op_set & {"SUM", "MEAN", "COUNT", "COMPARE"}:
+            sections.append(f"No aggregate calculation: {filename}, page {page}, table {table_index} contains total/subtotal rows; isolate detail rows first.")
+            continue
 
         for column in relevant_columns:
             series = numeric[column]
             valid = series.dropna().astype(float)
             if valid.empty:
                 continue
-
-            if "SUM" in op_set or "COMPARE" in op_set:
+            missing = int(series.isna().sum())
+            if missing:
+                facts.append(f"{column}: {missing} missing/unparseable cells; aggregates withheld")
+                continue
+            raw_values = frame[column].astype(str).str.strip()
+            percent = raw_values.str.endswith("%")
+            if percent.any() and not percent.all():
+                facts.append(f"{column}: mixed percent and plain values; aggregates withheld")
+                continue
+            currencies = {symbol for value in raw_values for symbol in "$£€₹" if symbol in value}
+            if len(currencies) > 1:
+                facts.append(f"{column}: mixed currencies; aggregates withheld")
+                continue
+            if percent.all() and "SUM" in op_set:
+                facts.append(f"{column}: percentage sum withheld (denominator/weight required)")
+            if ("SUM" in op_set or "COMPARE" in op_set) and not percent.all():
                 facts.append(f"{column} sum={float(valid.sum()):g}")
             if "MEAN" in op_set or "COMPARE" in op_set:
                 facts.append(f"{column} mean={float(valid.mean()):g}")
@@ -258,6 +300,12 @@ def build_table_facts(
                     facts.append(f"{column} ranked rows: " + " | ".join(ranked))
 
         if facts:
+            labels = [str(source["source_id"]) for source in (sources or [])
+                      if (source.get("document_id"), source.get("filename"), source.get("page"), source.get("table_index")) == key]
+            provenance = " ".join(f"[{label}]" for label in labels)
+            facts.insert(0, f"Calculation scope: {len(frame)} extracted rows from this table only. {provenance}")
+            if any(frame[column].astype(str).str.strip().str.endswith("%").all() for column in relevant_columns):
+                facts.insert(1, "Percentage values use percentage-point units; MEAN is an unweighted row mean, not an overall rate.")
             sections.append(
                 f"Computed deterministically from {filename}, page {page}, table {table_index}:\n"
                 + "\n".join(f"- {fact}" for fact in facts)

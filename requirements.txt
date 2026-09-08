@@ -20,3 +20,5 @@ python-multipart
 pdfplumber
 PyJWT
 scikit-learn
+
+filelock>=3.13

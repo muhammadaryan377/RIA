@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import re
 
+from .grounding import REFUSAL, citation_integrity
+
 from .conversation_layer import InsightPDFRAG as ConversationalInsightPDFRAG
 
 
@@ -61,47 +63,32 @@ class InsightPDFRAG(ConversationalInsightPDFRAG):
         # can still inspect where the grounded answer came from.
         return cleaned, sources[:4], "evidence_available_uncited"
 
-    def chat(
-        self,
-        question: str,
-        *,
-        conversation_id: str | None = None,
-        document_ids: list[str] | None = None,
-    ) -> dict:
-        result = super().chat(
-            question,
-            conversation_id=conversation_id,
-            document_ids=document_ids,
-        )
-
+    def finalize_result(self, result: dict) -> dict:
+        """Finalise every route before the outer scope layer persists the turn."""
         intent = str(result.get("intent") or "")
         evidence_status = str(result.get("evidence_status") or "")
         sources = list(result.get("sources") or [])
-
-        grounded_turn = (
-            evidence_status in {"supported", "carried_forward", "model_unavailable"}
-            and (intent == "document_query" or intent == "text_search" or intent.startswith("conversation_"))
-        )
-
-        if grounded_turn:
-            answer, sources, citation_status = self._finalize_sources(
-                str(result.get("answer") or ""),
-                sources,
-            )
-            result["answer"] = answer
-            result["sources"] = sources
-            result["retrieved_chunks"] = len(sources)
-            result["citation_status"] = citation_status
-        else:
-            result["citation_status"] = "not_applicable"
-
-        # Compact machine-readable grounding metadata is useful for tests and
-        # future evaluation, while user-facing answers remain natural.
+        grounded = evidence_status in {"supported", "carried_forward"} and bool(sources)
+        citation_status = "not_applicable"
+        if grounded:
+            integrity = citation_integrity(str(result.get("answer") or ""), sources)
+            if integrity != "valid":
+                result["answer"] = REFUSAL
+                result["evidence_status"] = "verification_failed"
+                sources = []
+                citation_status = integrity
+            else:
+                answer, sources, citation_status = self._finalize_sources(result["answer"], sources)
+                result["answer"] = answer
+        elif evidence_status in {"model_unavailable", "verification_failed", "verification_unavailable"}:
+            sources = []
+        result["sources"] = sources
+        result["citation_status"] = citation_status
         result["grounding"] = {
             "intent": intent,
-            "evidence_status": evidence_status,
-            "citation_status": result["citation_status"],
-            "used_pdf_evidence": bool(result.get("sources")),
+            "evidence_status": result.get("evidence_status"),
+            "citation_status": citation_status,
+            "used_pdf_evidence": bool(sources),
             "retrieval": result.get("retrieval") or "not_used",
         }
         return result

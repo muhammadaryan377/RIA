@@ -8,11 +8,12 @@ retrieval and grounded context construction.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import shutil
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from langchain_core.documents import Document
 
@@ -24,7 +25,9 @@ from .config import (
     RETRIEVAL_TOP_K,
     RAG_LLM_MODEL,
 )
+from .diagnostics import record
 from .pdf_ingest import extract_pdf_documents
+from .retrieval import bm25_search, chunk_key
 from .storage import ConversationStore, RAGMetadataStore, UserPGVectorStore
 
 _STOPWORDS = {
@@ -71,8 +74,12 @@ class InsightPDFRAG:
     # ------------------------------------------------------------------
 
     def ingest_pdf(self, pdf_path: str | Path, *, original_filename: str) -> dict:
+        with self.metadata.mutation_lock():
+            return self._ingest_pdf(pdf_path, original_filename=original_filename)
+
+    def _ingest_pdf(self, pdf_path: str | Path, *, original_filename: str) -> dict:
         path = Path(pdf_path)
-        filename = Path(original_filename).name
+        filename = PureWindowsPath(Path(original_filename).name).name
         if path.suffix.lower() != ".pdf" or not filename.lower().endswith(".pdf"):
             raise ValueError("Only PDF files are supported in the current Insight RAG version.")
         if not path.exists() or not path.is_file():
@@ -100,40 +107,51 @@ class InsightPDFRAG:
         )
 
         vector_store = UserPGVectorStore(self.user_id)
-        chunk_ids = vector_store.add_documents(documents)
+        chunk_ids = [str(doc.metadata["chunk_id"]) for doc in documents]
+        try:
+            vector_store.add_documents(documents)
 
-        destination = self.metadata.document_file_path(document_id)
-        shutil.copyfile(path, destination)
-        self.metadata.save_chunks(document_id, documents)
+            destination = self.metadata.document_file_path(document_id)
+            shutil.copyfile(path, destination)
+            self.metadata.save_chunks(document_id, documents)
 
-        record = {
-            "document_id": document_id,
-            "filename": filename,
-            "sha256": digest,
-            "size_bytes": size_bytes,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "pages": stats["pages"],
-            "tables": stats["tables"],
-            "text_chunks": stats["text_chunks"],
-            "table_chunks": stats["table_chunks"],
-            "total_chunks": stats["total_chunks"],
-            "chunk_ids": chunk_ids,
-        }
-        self.metadata.put_document(record)
+            record = {
+                "document_id": document_id,
+                "filename": filename,
+                "sha256": digest,
+                "size_bytes": size_bytes,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "pages": stats["pages"],
+                "tables": stats["tables"],
+                "text_chunks": stats["text_chunks"],
+                "table_chunks": stats["table_chunks"],
+                "total_chunks": stats["total_chunks"],
+                "chunk_ids": chunk_ids,
+            }
+            self.metadata.put_document(record)
+        except Exception:
+            try:
+                vector_store.delete_chunks(chunk_ids)
+            except Exception as cleanup_error:
+                logging.getLogger(__name__).error("Ingestion rollback requires index cleanup: %s", type(cleanup_error).__name__)
+            self.metadata.document_file_path(document_id).unlink(missing_ok=True)
+            self.metadata.chunks_path(document_id).unlink(missing_ok=True)
+            raise
         return {"ok": True, "duplicate": False, "document": record}
 
     def list_documents(self) -> list[dict]:
         return self.metadata.list_documents()
 
     def delete_document(self, document_id: str) -> dict:
-        record = self.metadata.get_document(document_id)
-        if not record:
-            raise ValueError("Document not found.")
-        UserPGVectorStore(self.user_id).delete_chunks(record.get("chunk_ids", []))
-        self.metadata.remove_document(document_id)
-        self.metadata.document_file_path(document_id).unlink(missing_ok=True)
-        self.metadata.chunks_path(document_id).unlink(missing_ok=True)
-        return {"ok": True, "document_id": document_id}
+        with self.metadata.mutation_lock():
+            record = self.metadata.get_document(document_id)
+            if not record:
+                raise ValueError("Document not found.")
+            UserPGVectorStore(self.user_id).delete_chunks(record.get("chunk_ids", []))
+            self.metadata.remove_document(document_id)
+            self.metadata.document_file_path(document_id).unlink(missing_ok=True)
+            self.metadata.chunks_path(document_id).unlink(missing_ok=True)
+            return {"ok": True, "document_id": document_id}
 
     # ------------------------------------------------------------------
     # Hybrid retrieval: dense + lexical + reciprocal-rank fusion
@@ -146,26 +164,10 @@ class InsightPDFRAG:
         *,
         prefer_tables: bool = False,
     ) -> list[Document]:
-        query_tokens = _tokenize(question)
-        lowered = question.lower().strip()
-        ranked: list[tuple[float, Document]] = []
-
-        for document_id in document_ids:
-            for doc in self.metadata.load_chunks(document_id):
-                content_lower = doc.page_content.lower()
-                doc_tokens = _tokenize(doc.page_content)
-                overlap = len(query_tokens & doc_tokens) / max(1, len(query_tokens))
-                exact_hits = sum(
-                    1 for token in query_tokens if len(token) >= 4 and token in content_lower
-                )
-                phrase_boost = 0.35 if len(lowered) >= 6 and lowered in content_lower else 0.0
-                table_boost = 0.08 if prefer_tables and doc.metadata.get("content_type") == "table" else 0.0
-                score = overlap + min(0.45, exact_hits * 0.07) + phrase_boost + table_boost
-                if score > 0:
-                    ranked.append((score, doc))
-
-        ranked.sort(key=lambda item: item[0], reverse=True)
-        return [doc for _, doc in ranked[:RETRIEVAL_FETCH_K]]
+        del prefer_tables  # Table preference is applied after lexical relevance.
+        corpus = [doc for document_id in document_ids
+                  for doc in self.metadata.load_chunks(document_id)]
+        return bm25_search(question, corpus, limit=RETRIEVAL_FETCH_K)
 
     @staticmethod
     def _hybrid_rrf(
@@ -181,12 +183,12 @@ class InsightPDFRAG:
         rrf_k = 60.0
 
         for rank, (doc, _distance) in enumerate(dense_candidates, start=1):
-            chunk_id = str(doc.metadata.get("chunk_id") or f"dense-{rank}")
+            chunk_id = chunk_key(doc)
             docs_by_id[chunk_id] = doc
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (rrf_k + rank)
 
         for rank, doc in enumerate(lexical_candidates, start=1):
-            chunk_id = str(doc.metadata.get("chunk_id") or f"lexical-{rank}")
+            chunk_id = chunk_key(doc)
             docs_by_id[chunk_id] = doc
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (rrf_k + rank)
 
@@ -198,7 +200,7 @@ class InsightPDFRAG:
                 scores[chunk_id] += 0.003
 
         ranked_ids = sorted(scores, key=scores.get, reverse=True)
-        return [docs_by_id[chunk_id] for chunk_id in ranked_ids[:RETRIEVAL_TOP_K]]
+        return [docs_by_id[chunk_id] for chunk_id in ranked_ids[:RETRIEVAL_FETCH_K]]
 
     def _expand_table_siblings(self, docs: list[Document]) -> list[Document]:
         """Include sibling chunks when a large table was split during ingestion."""
@@ -243,11 +245,16 @@ class InsightPDFRAG:
         *,
         prefer_tables: bool = False,
     ) -> list[Document]:
-        dense = UserPGVectorStore(self.user_id).search(
-            question,
-            k=RETRIEVAL_FETCH_K,
-            document_ids=document_ids,
-        )
+        if not document_ids:
+            return []
+        try:
+            dense = UserPGVectorStore(self.user_id).search(
+                question, k=RETRIEVAL_FETCH_K, document_ids=document_ids,
+            )
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Dense retrieval unavailable: %s", type(exc).__name__)
+            dense = []
+            record("dense_degraded", True)
         lexical = self._lexical_candidates(
             question,
             document_ids,
@@ -282,11 +289,17 @@ class InsightPDFRAG:
             title = f"[{label}] {meta.get('filename')} — page {meta.get('page')} — {content_type}"
             if content_type == "table" and table_index:
                 title += f" {table_index}"
-            block = f"{title}\n{doc.page_content.strip()}"
-            if used_chars + len(block) > MAX_CONTEXT_CHARS and blocks:
-                break
+            remaining = MAX_CONTEXT_CHARS - used_chars - (2 if blocks else 0)
+            content = doc.page_content.strip()
+            block = f"{title}\n{content}"
+            if len(block) > remaining:
+                # Never truncate table rows into malformed evidence.
+                if content_type == "table" or remaining < len(title) + 100:
+                    continue
+                content = content[:remaining - len(title) - 14] + " [truncated]"
+                block = f"{title}\n{content}"
+            used_chars += len(block) + (2 if blocks else 0)
             blocks.append(block)
-            used_chars += len(block)
             sources.append(
                 {
                     "source_id": label,
@@ -296,7 +309,8 @@ class InsightPDFRAG:
                     "content_type": content_type,
                     "table_index": table_index,
                     "chunk_id": meta.get("chunk_id"),
-                    "snippet": doc.page_content[:280].replace("\n", " "),
+                    "snippet": content[:280].replace("\n", " "),
+                    "context_truncated": content != doc.page_content.strip(),
                 }
             )
         return "\n\n".join(blocks), sources

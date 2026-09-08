@@ -6,6 +6,9 @@ from threading import Lock
 
 from langchain_core.documents import Document
 
+from .diagnostics import record
+from .retrieval import deduplicate_chunks
+
 from .config import RERANKER_ENABLED, RERANKER_MODEL, RERANKER_TOP_K
 
 
@@ -46,23 +49,28 @@ class LocalCrossEncoderReranker:
         *,
         top_k: int | None = None,
     ) -> list[Document]:
+        documents = deduplicate_chunks(documents)
         if not documents:
             return []
         model = cls._get_model()
         limit = max(1, int(top_k or RERANKER_TOP_K))
         if model is None:
+            record("reranker_status", "unavailable" if RERANKER_ENABLED else "disabled")
             return documents[:limit]
 
         try:
             texts = [doc.page_content for doc in documents]
             scores = list(model.rerank(query, texts))
             if len(scores) != len(documents):
+                record("reranker_status", "invalid_scores")
                 return documents[:limit]
             ranked = sorted(
                 zip(scores, documents),
                 key=lambda item: float(item[0]),
                 reverse=True,
             )
+            record("reranker_status", "applied")
             return [doc for _, doc in ranked[:limit]]
         except Exception:
+            record("reranker_status", "failed")
             return documents[:limit]

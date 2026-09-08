@@ -149,7 +149,8 @@ def extract_pdf_documents(
                 if len(rows) < 2:
                     continue
                 table_count += 1
-                for ordinal, table_text in enumerate(_chunk_table(rows)):
+                table_chunks = _chunk_table(rows)
+                for ordinal, table_text in enumerate(table_chunks):
                     if not table_text.strip():
                         continue
                     documents.append(
@@ -161,6 +162,9 @@ def extract_pdf_documents(
                                 "page": page_number,
                                 "content_type": "table",
                                 "table_index": table_index,
+                                "table_chunk_index": ordinal,
+                                "table_chunk_count": len(table_chunks),
+                                "table_row_count": len(rows) - 1,
                                 "chunk_id": _stable_chunk_id(
                                     document_id, f"table-{table_index}", page_number, ordinal
                                 ),
