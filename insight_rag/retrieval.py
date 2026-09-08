@@ -36,14 +36,16 @@ def _with_retrieval_metadata(doc: Document, **values) -> Document:
 def fuse_ranked_lists(rankings: list[list[Document]]) -> list[Document]:
     """RRF across subqueries with auditable consensus metadata.
 
-    ``retrieval_votes`` counts independent ranked lists that returned a chunk.
-    ``retrieval_rrf_score`` and ``retrieval_subquery_ranks`` make retrieval
-    behavior inspectable without exposing user queries or PDF text.
+    ``retrieval_votes`` counts independent ranked lists that returned a chunk and
+    ``retrieval_query_count`` is the denominator.  This allows monitoring to
+    compare single-query and decomposed-query requests without inflating scores.
     """
     scores: dict[str, float] = {}
     documents: dict[str, Document] = {}
     ranks: dict[str, list[int]] = {}
-    for ranking in rankings:
+    active_rankings = [ranking for ranking in rankings if ranking]
+    query_count = max(1, len(active_rankings))
+    for ranking in active_rankings:
         seen_in_ranking: set[str] = set()
         for rank, doc in enumerate(deduplicate_chunks(ranking), start=1):
             key = chunk_key(doc)
@@ -58,6 +60,7 @@ def fuse_ranked_lists(rankings: list[list[Document]]) -> list[Document]:
         _with_retrieval_metadata(
             documents[key],
             retrieval_votes=len(ranks.get(key, [])),
+            retrieval_query_count=query_count,
             retrieval_rrf_score=round(scores[key], 8),
             retrieval_subquery_ranks=list(ranks.get(key, [])),
         )
