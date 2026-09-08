@@ -143,6 +143,10 @@ def reformat_grounded_answer(
         return answer
 
     labels = cited_labels(answer)
+    # This helper is only for already-grounded answers. If the generator returned
+    # no source labels (for example an insufficiency message), do not touch it.
+    if not labels:
+        return answer
     original = _strip_citations(answer)
     if not original:
         return answer
@@ -152,7 +156,7 @@ def reformat_grounded_answer(
         if directive.shape == "ONE_LINE":
             shaped = _normalise_shape(original, directive)
             suffix = " ".join(f"[{label}]" for label in labels)
-            return (f"{shaped} {suffix}" if suffix else shaped).strip()
+            return f"{shaped} {suffix}".strip()
         return answer
 
     schema = {
@@ -201,10 +205,10 @@ def reformat_grounded_answer(
             return answer
         text = _normalise_shape(text, directive)
         suffix = " ".join(f"[{label}]" for label in labels)
-        return (f"{text} {suffix}" if suffix else text).strip()
+        return f"{text} {suffix}".strip()
     except Exception:
         if directive.shape == "ONE_LINE":
             shaped = _normalise_shape(original, directive)
             suffix = " ".join(f"[{label}]" for label in labels)
-            return (f"{shaped} {suffix}" if suffix else shaped).strip()
+            return f"{shaped} {suffix}".strip()
         return answer
