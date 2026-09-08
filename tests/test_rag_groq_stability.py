@@ -76,6 +76,35 @@ def test_compact_router_normalises_null_arrays_to_empty_lists():
     assert parsed.target_pages == []
 
 
+def test_task_as_scope_alias_is_accepted_and_normalised():
+    strict = SemanticRouter._strict_json_schema()
+    assert "DOCUMENT_METADATA" in strict["properties"]["scope"]["enum"]
+
+    parsed = SemanticRouter._validate_rich(_rich_route(
+        scope="DOCUMENT_METADATA",
+        task="DOCUMENT_METADATA",
+        broad_query=False,
+        metadata_kind="INVENTORY_COUNT",
+        document_keys=None,
+    ))
+    assert parsed.scope == "DOCUMENT"
+    assert parsed.task == "DOCUMENT_METADATA"
+    assert parsed.document_keys == []
+
+
+def test_router_prompt_covers_whole_pdf_explanation_and_previous_answer_pronouns():
+    messages = SemanticRouter._messages(
+        "explain it", manifest="D1: filename='First 3 topic.pdf'; pages=10; tables=0; selected=yes",
+        history_text="ASSISTANT: You currently have 1 PDF: First 3 topic.pdf.",
+    )
+    policy = messages[0]["content"]
+    assert "explain my PDF" in policy
+    assert "DOCUMENT/DOCUMENT_SUMMARY" in policy
+    assert "'explain it'" in policy
+    assert "CONVERSATION/PREVIOUS_ANSWER" in policy
+    assert "scope=DOCUMENT and task=DOCUMENT_METADATA" in policy
+
+
 class _RateLimitError(RuntimeError):
     status_code = 429
 
