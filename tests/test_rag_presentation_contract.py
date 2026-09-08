@@ -65,11 +65,13 @@ def test_previous_answer_one_line_has_deterministic_safe_fallback_after_verifier
     transformed = rag._transform_previous_answer("in just one line", _previous_answer())
 
     # A purely presentational one-line request must not become a generic refusal.
-    # The fallback changes only whitespace/bullet layout and preserves all sources.
+    # The fallback changes only whitespace/bullet layout and preserves the existing
+    # citation placement instead of moving labels away from their original claims.
     assert "\n" not in transformed
     assert "Data science concepts are introduced." in transformed
     assert "Tools and workflow stages are explained." in transformed
-    assert transformed.endswith("[S1] [S2]")
+    assert "[S1]" in transformed and "[S2]" in transformed
+    assert transformed.index("[S1]") < transformed.index("Tools and workflow stages")
 
 
 def test_grounded_one_line_reformat_preserves_existing_citations():
