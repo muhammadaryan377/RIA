@@ -16,9 +16,15 @@ RAG_DATABASE_URL = (
 ).strip()
 
 EMBEDDING_MODEL = os.getenv("ARIA_RAG_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-RAG_LLM_MODEL = os.getenv(
-    "ARIA_RAG_LLM_MODEL",
-    os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+
+# During the Groq -> DeepSeek migration an existing local .env may still contain
+# ARIA_RAG_LLM_MODEL=openai/gpt-oss-20b. Do not send that legacy Groq model name
+# to DeepSeek. Explicit DeepSeek model overrides remain supported.
+_requested_rag_model = os.getenv("ARIA_RAG_LLM_MODEL", "").strip()
+RAG_LLM_MODEL = (
+    _requested_rag_model
+    if _requested_rag_model.startswith("deepseek-")
+    else os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
 )
 RAG_COLLECTION_PREFIX = os.getenv("ARIA_RAG_COLLECTION_PREFIX", "aria_insight_pdf")
 
