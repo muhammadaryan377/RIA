@@ -126,7 +126,7 @@ class InsightPDFRAG:
             self.metadata.save_chunks(document_id, documents)
 
             quality = dict(stats.get("ingestion_quality") or {})
-            record = {
+            document_record = {
                 "document_id": document_id,
                 "filename": filename,
                 "sha256": digest,
@@ -142,29 +142,32 @@ class InsightPDFRAG:
                 "chunk_ids": chunk_ids,
                 "rag_schema_version": 2,
             }
-            self.metadata.put_document(record)
+            self.metadata.put_document(document_record)
         except Exception:
             try:
                 vector_store.delete_chunks(chunk_ids)
             except Exception as cleanup_error:
-                logging.getLogger(__name__).error("Ingestion rollback requires index cleanup: %s", type(cleanup_error).__name__)
+                logging.getLogger(__name__).error(
+                    "Ingestion rollback requires index cleanup: %s",
+                    type(cleanup_error).__name__,
+                )
             self.metadata.document_file_path(document_id).unlink(missing_ok=True)
             self.metadata.chunks_path(document_id).unlink(missing_ok=True)
             raise
 
         record("ingestion_quality_grade", (stats.get("ingestion_quality") or {}).get("grade", "unknown"))
         increment("ingested_chunks", len(documents))
-        return {"ok": True, "duplicate": False, "document": record}
+        return {"ok": True, "duplicate": False, "document": document_record}
 
     def list_documents(self) -> list[dict]:
         return self.metadata.list_documents()
 
     def delete_document(self, document_id: str) -> dict:
         with self.metadata.mutation_lock():
-            record = self.metadata.get_document(document_id)
-            if not record:
+            document_record = self.metadata.get_document(document_id)
+            if not document_record:
                 raise ValueError("Document not found.")
-            UserPGVectorStore(self.user_id).delete_chunks(record.get("chunk_ids", []))
+            UserPGVectorStore(self.user_id).delete_chunks(document_record.get("chunk_ids", []))
             self.metadata.remove_document(document_id)
             self.metadata.document_file_path(document_id).unlink(missing_ok=True)
             self.metadata.chunks_path(document_id).unlink(missing_ok=True)
@@ -377,6 +380,8 @@ class InsightPDFRAG:
                     "retrieval_bm25_score": meta.get("retrieval_bm25_score"),
                     "retrieval_dense_rank": meta.get("retrieval_dense_rank"),
                     "retrieval_lexical_rank": meta.get("retrieval_lexical_rank"),
+                    "retrieval_reranker_score": meta.get("retrieval_reranker_score"),
+                    "retrieval_reranker_rank": meta.get("retrieval_reranker_rank"),
                     "retrieval_sibling": bool(meta.get("retrieval_sibling", False)),
                     "security_flags": list(meta.get("security_flags") or []),
                 }
