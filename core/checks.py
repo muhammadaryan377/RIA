@@ -19,7 +19,6 @@ from pathlib import Path
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 
-# package name -> (import module, pip install argument)
 _REQUIRED_PACKAGES = {
     "fastapi": ("fastapi", "fastapi"),
     "uvicorn": ("uvicorn", "uvicorn"),
@@ -37,7 +36,7 @@ _REQUIRED_PACKAGES = {
 
 _OPTIONAL_PACKAGES = {
     "pymysql": ("pymysql", "pymysql"),       # only needed for MySQL sources
-    "groq": ("groq", "groq"),                # only needed for the Cloud (Groq) provider
+    "openai": ("openai", "openai"),          # OpenAI-compatible client used by DeepSeek cloud
     "ollama": ("ollama", "ollama"),          # only needed for the Local (Ollama) provider
     "langgraph": ("langgraph", "langgraph"), # used by goal_agent; falls back to a linear flow
 }
@@ -72,26 +71,23 @@ def check_env():
         "DB_PASSWORD": bool(os.getenv("DB_PASSWORD")),
         "DB_HOST": bool(os.getenv("DB_HOST")),
         "DB_NAME": bool(os.getenv("DB_NAME")),
-        "GROQ_API_KEY": bool(os.getenv("GROQ_API_KEY")),
+        "DEEPSEEK_API_KEY": bool(os.getenv("DEEPSEEK_API_KEY")),
     }
     jwt_secret_path = _BASE_DIR / "data" / ".jwt_secret"
     env["jwt_secret_persisted"] = jwt_secret_path.exists()
 
     notes = []
-    if not env["GROQ_API_KEY"]:
+    if not env["DEEPSEEK_API_KEY"]:
         notes.append(
-            "Cloud provider will fail until GROQ_API_KEY is set (or a key is "
-            "provided in the UI)."
+            "Cloud provider will fail until DEEPSEEK_API_KEY is set (or a key is provided in the UI)."
         )
     if not env["DB_NAME"]:
         notes.append(
-            "DB_NAME not set in .env: databases are connected per-session through "
-            "the UI, so this is only needed for standalone scripts."
+            "DB_NAME not set in .env: databases are connected per-session through the UI, so this is only needed for standalone scripts."
         )
     if not env["jwt_secret_persisted"]:
         notes.append(
-            "No persisted JWT secret yet: one is generated on first start "
-            "(data/.jwt_secret) so tokens survive restarts."
+            "No persisted JWT secret yet: one is generated on first start (data/.jwt_secret) so tokens survive restarts."
         )
     return {"env": env, "notes": notes}
 
@@ -106,8 +102,7 @@ def check_ollama():
     except Exception as exc:
         return {
             "ok": False,
-            "detail": f"not reachable at {host}: {type(exc).__name__}. "
-            "Start Ollama (ollama serve) and pull the aria-* models to use the Local provider.",
+            "detail": f"not reachable at {host}: {type(exc).__name__}. Start Ollama (ollama serve) and pull the aria-* models to use the Local provider.",
         }
 
 
