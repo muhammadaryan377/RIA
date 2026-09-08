@@ -36,6 +36,9 @@ logging.basicConfig(level=logging.INFO)
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_VISION_MODEL = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash-vision-exp")
+DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "disabled").strip().lower()
+if DEEPSEEK_THINKING not in {"enabled", "disabled"}:
+    DEEPSEEK_THINKING = "disabled"
 
 # ---------------------------------------------------------------------------
 # Provider metadata
@@ -67,9 +70,9 @@ PROVIDERS = {
     },
 }
 
-# Local Ollama models default to a small runtime context (often 4096 tokens).
 LOCAL_NUM_CTX = 8192
 _RETRY_AFTER_RE = re.compile(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
+_CONTROL_ROLES = {"rag_scope", "rag_verify", "rag_rewrite", "rag_plan"}
 
 
 class LLMProvider:
@@ -96,12 +99,15 @@ class LLMProvider:
                 max_retries=0,
             )
 
-    # -- model lookup ---------------------------------------------------
-
     def model_for(self, role):
         return self.models.get(role)
 
-    # -- unified chat ---------------------------------------------------
+    @staticmethod
+    def _thinking_body(role=None):
+        # Control-plane calls use tiny bounded outputs and must not spend that
+        # budget on hidden reasoning. General generation follows the env switch.
+        thinking = "disabled" if role in _CONTROL_ROLES else DEEPSEEK_THINKING
+        return {"thinking": {"type": thinking}}
 
     def chat(self, role, messages, temperature=0.1, num_predict=400, timeout=None):
         if timeout is None:
@@ -116,7 +122,7 @@ class LLMProvider:
         try:
             if self.provider == "local":
                 return self._chat_local(model, messages, temperature, num_predict, timeout)
-            return self._chat_cloud(model, messages, temperature, num_predict, timeout)
+            return self._chat_cloud(role, model, messages, temperature, num_predict, timeout)
         except TimeoutError:
             raise
         except Exception as exc:
@@ -141,7 +147,7 @@ class LLMProvider:
         ARIA still performs its own Pydantic/schema validation after generation, so
         provider JSON mode is a formatting guarantee rather than a trust boundary.
         """
-        del reasoning_effort  # DeepSeek-specific thinking is not needed for router JSON.
+        del reasoning_effort
         if self.provider != "cloud":
             raise RuntimeError("Structured output is currently available only on the cloud provider.")
         if timeout is None:
@@ -206,6 +212,7 @@ class LLMProvider:
                     temperature=temperature,
                     max_tokens=num_predict,
                     timeout=timeout,
+                    extra_body=self._thinking_body(role),
                 )
             )
             content = completion.choices[0].message.content
@@ -245,7 +252,7 @@ class LLMProvider:
         )
         return response["message"]["content"].strip()
 
-    def _chat_cloud(self, model, messages, temperature, num_predict, timeout):
+    def _chat_cloud(self, role, model, messages, temperature, num_predict, timeout):
         completion = self._cloud_with_retry(
             lambda: self._cloud_client.chat.completions.create(
                 model=model,
@@ -253,6 +260,7 @@ class LLMProvider:
                 temperature=temperature,
                 max_tokens=num_predict,
                 timeout=timeout,
+                extra_body=self._thinking_body(role),
             )
         )
         content = completion.choices[0].message.content
@@ -331,6 +339,7 @@ class LLMProvider:
                 temperature=temperature,
                 max_tokens=num_predict,
                 timeout=timeout,
+                extra_body={"thinking": {"type": "disabled"}},
                 **kwargs,
             )
         )
@@ -351,8 +360,7 @@ def create_provider(provider="local", api_key=None, models=None, base_url=None):
     if provider == "cloud":
         if not DEEPSEEK_AVAILABLE:
             raise RuntimeError(
-                "The Cloud provider requires the OpenAI-compatible client package. "
-                "Run: pip install openai"
+                "The Cloud provider requires the OpenAI-compatible client package. Run: pip install openai"
             )
         return LLMProvider(
             "cloud",
