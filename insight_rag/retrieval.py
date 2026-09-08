@@ -1,4 +1,4 @@
-"""Dependency-free BM25 and stable chunk identity for bounded PDF retrieval."""
+"""Dependency-free lexical retrieval, RRF fusion and provenance signals."""
 
 from __future__ import annotations
 
@@ -27,15 +27,42 @@ def deduplicate_chunks(documents: list[Document]) -> list[Document]:
     return list(unique.values())
 
 
+def _with_retrieval_metadata(doc: Document, **values) -> Document:
+    metadata = dict(doc.metadata)
+    metadata.update(values)
+    return Document(page_content=doc.page_content, metadata=metadata)
+
+
 def fuse_ranked_lists(rankings: list[list[Document]]) -> list[Document]:
-    """RRF across subqueries so duplicate hits cannot consume reranker slots."""
-    scores, documents = {}, {}
+    """RRF across subqueries with auditable consensus metadata.
+
+    ``retrieval_votes`` counts independent ranked lists that returned a chunk.
+    ``retrieval_rrf_score`` and ``retrieval_subquery_ranks`` make retrieval
+    behavior inspectable without exposing user queries or PDF text.
+    """
+    scores: dict[str, float] = {}
+    documents: dict[str, Document] = {}
+    ranks: dict[str, list[int]] = {}
     for ranking in rankings:
+        seen_in_ranking: set[str] = set()
         for rank, doc in enumerate(deduplicate_chunks(ranking), start=1):
             key = chunk_key(doc)
             documents.setdefault(key, doc)
             scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
-    return [documents[key] for key in sorted(scores, key=scores.get, reverse=True)]
+            if key not in seen_in_ranking:
+                ranks.setdefault(key, []).append(rank)
+                seen_in_ranking.add(key)
+
+    ordered = sorted(scores, key=lambda key: (-scores[key], key))
+    return [
+        _with_retrieval_metadata(
+            documents[key],
+            retrieval_votes=len(ranks.get(key, [])),
+            retrieval_rrf_score=round(scores[key], 8),
+            retrieval_subquery_ranks=list(ranks.get(key, [])),
+        )
+        for key in ordered
+    ]
 
 
 def terms(text: str) -> list[str]:
@@ -48,6 +75,8 @@ def bm25_search(query: str, documents: list[Document], *, limit: int) -> list[Do
 
     The corpus must already be restricted to the authenticated user's active
     documents. Index construction is request-local; no stale cross-user cache.
+    Returned chunks include their BM25 score/rank for diagnostics and source
+    provenance; the score is not treated as a calibrated relevance probability.
     """
     documents = deduplicate_chunks(documents)
     if not documents or not terms(query):
@@ -68,4 +97,11 @@ def bm25_search(query: str, documents: list[Document], *, limit: int) -> list[Do
         if score > 0:
             scores.append((score, index))
     scores.sort(key=lambda item: (-item[0], item[1]))
-    return [documents[index] for _, index in scores[:max(0, limit)]]
+    return [
+        _with_retrieval_metadata(
+            documents[index],
+            retrieval_bm25_score=round(score, 8),
+            retrieval_bm25_rank=rank,
+        )
+        for rank, (score, index) in enumerate(scores[:max(0, limit)], start=1)
+    ]
