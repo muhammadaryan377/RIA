@@ -12,9 +12,11 @@ apply_provider_stability_patches()
 
 from .scope_layer import InsightPDFRAG
 from .answer_stability import apply_answer_stability_patches
+from .verification_stability import apply_verification_stability_patches
 
-# Broad summaries use a citation-complete generation prompt so the strict
-# fail-closed verifier does not reject otherwise grounded teaching summaries.
+# Broad summaries use source-bound generation, while both evidence sufficiency
+# and final answer auditing use provider-stable binary verdicts.
 apply_answer_stability_patches()
+apply_verification_stability_patches()
 
 __all__ = ["InsightPDFRAG"]
