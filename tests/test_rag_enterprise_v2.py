@@ -1,7 +1,9 @@
 """Enterprise-v2 regressions for quality, provenance, security and evaluation."""
 
+import pytest
 from langchain_core.documents import Document
 
+from insight_rag.diagnostics import stage
 from insight_rag.enterprise_quality import (
     assess_ingestion_quality,
     grounding_quality,
@@ -23,6 +25,12 @@ def _doc(chunk_id: str, text: str = "Revenue increased in 2025.", *, page: int =
             "content_type": "text",
         },
     )
+
+
+def test_diagnostics_timer_never_suppresses_application_exception():
+    with pytest.raises(OSError, match="disk full"):
+        with stage("write"):
+            raise OSError("disk full")
 
 
 def test_instruction_like_pdf_text_is_flagged_as_untrusted_signal():
@@ -56,6 +64,7 @@ def test_multiquery_rrf_exposes_consensus_denominator_and_votes():
         [shared, only_first],
         [shared, only_second],
     ])
+    assert fused[0] is shared
     assert fused[0].metadata["retrieval_votes"] == 2
     assert fused[0].metadata["retrieval_query_count"] == 2
     assert fused[0].metadata["retrieval_rrf_score"] > 0
