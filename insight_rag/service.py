@@ -25,7 +25,7 @@ from .config import (
     RETRIEVAL_TOP_K,
     RAG_LLM_MODEL,
 )
-from .diagnostics import record
+from .diagnostics import increment, record, stage
 from .pdf_ingest import extract_pdf_documents
 from .retrieval import bm25_search, chunk_key
 from .storage import ConversationStore, RAGMetadataStore, UserPGVectorStore
@@ -53,6 +53,12 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _with_metadata(doc: Document, **values) -> Document:
+    metadata = dict(doc.metadata)
+    metadata.update(values)
+    return Document(page_content=doc.page_content, metadata=metadata)
+
+
 class InsightPDFRAG:
     """Shared core capability attached to the existing Insight Agent."""
 
@@ -61,7 +67,7 @@ class InsightPDFRAG:
         self.llm = insight_agent.llm
         if getattr(self.llm, "provider", None) != "cloud":
             raise RuntimeError(
-                "Insight PDF RAG uses the Cloud LLM. Configure GROQ_API_KEY before using PDF chat."
+                "Insight PDF RAG uses the configured Cloud LLM. Configure DEEPSEEK_API_KEY before using PDF chat."
             )
         self.llm.models["rag"] = RAG_LLM_MODEL
         self.llm.models["rag_rewrite"] = RAG_LLM_MODEL
@@ -75,7 +81,8 @@ class InsightPDFRAG:
 
     def ingest_pdf(self, pdf_path: str | Path, *, original_filename: str) -> dict:
         with self.metadata.mutation_lock():
-            return self._ingest_pdf(pdf_path, original_filename=original_filename)
+            with stage("ingestion_total"):
+                return self._ingest_pdf(pdf_path, original_filename=original_filename)
 
     def _ingest_pdf(self, pdf_path: str | Path, *, original_filename: str) -> dict:
         path = Path(pdf_path)
@@ -97,24 +104,28 @@ class InsightPDFRAG:
         digest = _sha256_file(path)
         existing = self.metadata.find_by_sha256(digest)
         if existing:
+            record("ingestion_duplicate", True)
             return {"ok": True, "duplicate": True, "document": existing}
 
         document_id = str(uuid.uuid4())
-        documents, stats = extract_pdf_documents(
-            path,
-            document_id=document_id,
-            filename=filename,
-        )
+        with stage("pdf_extraction"):
+            documents, stats = extract_pdf_documents(
+                path,
+                document_id=document_id,
+                filename=filename,
+            )
 
         vector_store = UserPGVectorStore(self.user_id)
         chunk_ids = [str(doc.metadata["chunk_id"]) for doc in documents]
         try:
-            vector_store.add_documents(documents)
+            with stage("vector_index_write"):
+                vector_store.add_documents(documents)
 
             destination = self.metadata.document_file_path(document_id)
             shutil.copyfile(path, destination)
             self.metadata.save_chunks(document_id, documents)
 
+            quality = dict(stats.get("ingestion_quality") or {})
             record = {
                 "document_id": document_id,
                 "filename": filename,
@@ -126,7 +137,10 @@ class InsightPDFRAG:
                 "text_chunks": stats["text_chunks"],
                 "table_chunks": stats["table_chunks"],
                 "total_chunks": stats["total_chunks"],
+                "text_chars": stats.get("text_chars", 0),
+                "ingestion_quality": quality,
                 "chunk_ids": chunk_ids,
+                "rag_schema_version": 2,
             }
             self.metadata.put_document(record)
         except Exception:
@@ -137,6 +151,9 @@ class InsightPDFRAG:
             self.metadata.document_file_path(document_id).unlink(missing_ok=True)
             self.metadata.chunks_path(document_id).unlink(missing_ok=True)
             raise
+
+        record("ingestion_quality_grade", (stats.get("ingestion_quality") or {}).get("grade", "unknown"))
+        increment("ingested_chunks", len(documents))
         return {"ok": True, "duplicate": False, "document": record}
 
     def list_documents(self) -> list[dict]:
@@ -177,30 +194,58 @@ class InsightPDFRAG:
         *,
         prefer_tables: bool = False,
     ) -> list[Document]:
+        """Fuse dense + lexical retrieval and keep channel-level provenance."""
         query_tokens = _tokenize(question)
         scores: dict[str, float] = {}
         docs_by_id: dict[str, Document] = {}
+        dense_ranks: dict[str, int] = {}
+        lexical_ranks: dict[str, int] = {}
+        dense_distances: dict[str, float] = {}
         rrf_k = 60.0
 
-        for rank, (doc, _distance) in enumerate(dense_candidates, start=1):
+        for rank, (doc, distance) in enumerate(dense_candidates, start=1):
             chunk_id = chunk_key(doc)
             docs_by_id[chunk_id] = doc
+            dense_ranks.setdefault(chunk_id, rank)
+            try:
+                dense_distances.setdefault(chunk_id, float(distance))
+            except (TypeError, ValueError):
+                pass
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (rrf_k + rank)
 
         for rank, doc in enumerate(lexical_candidates, start=1):
             chunk_id = chunk_key(doc)
+            # Prefer the lexical copy because BM25 provenance is already attached.
             docs_by_id[chunk_id] = doc
+            lexical_ranks.setdefault(chunk_id, rank)
             scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (rrf_k + rank)
 
+        overlap_scores: dict[str, float] = {}
         for chunk_id, doc in docs_by_id.items():
             doc_tokens = _tokenize(doc.page_content)
             overlap = len(query_tokens & doc_tokens) / max(1, len(query_tokens))
+            overlap_scores[chunk_id] = overlap
             scores[chunk_id] += 0.006 * overlap
             if prefer_tables and doc.metadata.get("content_type") == "table":
                 scores[chunk_id] += 0.003
 
-        ranked_ids = sorted(scores, key=scores.get, reverse=True)
-        return [docs_by_id[chunk_id] for chunk_id in ranked_ids[:RETRIEVAL_FETCH_K]]
+        ranked_ids = sorted(scores, key=lambda key: (-scores[key], key))
+        output: list[Document] = []
+        for chunk_id in ranked_ids[:RETRIEVAL_FETCH_K]:
+            channel_votes = int(chunk_id in dense_ranks) + int(chunk_id in lexical_ranks)
+            values = {
+                "retrieval_hybrid_score": round(scores[chunk_id], 8),
+                "retrieval_channel_votes": channel_votes,
+                "retrieval_lexical_overlap": round(overlap_scores.get(chunk_id, 0.0), 4),
+            }
+            if chunk_id in dense_ranks:
+                values["retrieval_dense_rank"] = dense_ranks[chunk_id]
+            if chunk_id in lexical_ranks:
+                values["retrieval_lexical_rank"] = lexical_ranks[chunk_id]
+            if chunk_id in dense_distances:
+                values["retrieval_dense_distance"] = round(dense_distances[chunk_id], 8)
+            output.append(_with_metadata(docs_by_id[chunk_id], **values))
+        return output
 
     def _expand_table_siblings(self, docs: list[Document]) -> list[Document]:
         """Include sibling chunks when a large table was split during ingestion."""
@@ -234,7 +279,9 @@ class InsightPDFRAG:
                     continue
                 chunk_id = str(meta.get("chunk_id", ""))
                 if chunk_id and chunk_id not in seen:
-                    result.append(sibling)
+                    # Sibling chunks are included for deterministic table math, not
+                    # because they independently won retrieval. Mark that explicitly.
+                    result.append(_with_metadata(sibling, retrieval_sibling=True))
                     seen.add(chunk_id)
         return result
 
@@ -247,25 +294,36 @@ class InsightPDFRAG:
     ) -> list[Document]:
         if not document_ids:
             return []
-        try:
-            dense = UserPGVectorStore(self.user_id).search(
-                question, k=RETRIEVAL_FETCH_K, document_ids=document_ids,
+        with stage("dense_retrieval"):
+            try:
+                dense = UserPGVectorStore(self.user_id).search(
+                    question, k=RETRIEVAL_FETCH_K, document_ids=document_ids,
+                )
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Dense retrieval unavailable: %s", type(exc).__name__)
+                dense = []
+                record("dense_degraded", True)
+        with stage("lexical_retrieval"):
+            lexical = self._lexical_candidates(
+                question,
+                document_ids,
+                prefer_tables=prefer_tables,
             )
-        except Exception as exc:
-            logging.getLogger(__name__).warning("Dense retrieval unavailable: %s", type(exc).__name__)
-            dense = []
-            record("dense_degraded", True)
-        lexical = self._lexical_candidates(
-            question,
-            document_ids,
-            prefer_tables=prefer_tables,
-        )
-        fused = self._hybrid_rrf(
-            question,
-            dense,
-            lexical,
-            prefer_tables=prefer_tables,
-        )
+        with stage("hybrid_fusion"):
+            fused = self._hybrid_rrf(
+                question,
+                dense,
+                lexical,
+                prefer_tables=prefer_tables,
+            )
+
+        record("dense_candidate_count", len(dense))
+        record("lexical_candidate_count", len(lexical))
+        record("hybrid_candidate_count", len(fused))
+        record("hybrid_channel_consensus", sum(
+            1 for doc in fused if int(doc.metadata.get("retrieval_channel_votes", 0) or 0) >= 2
+        ))
+        increment("retrieval_calls")
         return self._expand_table_siblings(fused)
 
     # ------------------------------------------------------------------
@@ -311,8 +369,20 @@ class InsightPDFRAG:
                     "chunk_id": meta.get("chunk_id"),
                     "snippet": content[:280].replace("\n", " "),
                     "context_truncated": content != doc.page_content.strip(),
+                    "retrieval_votes": meta.get("retrieval_votes"),
+                    "retrieval_query_count": meta.get("retrieval_query_count"),
+                    "retrieval_channel_votes": meta.get("retrieval_channel_votes"),
+                    "retrieval_rrf_score": meta.get("retrieval_rrf_score"),
+                    "retrieval_hybrid_score": meta.get("retrieval_hybrid_score"),
+                    "retrieval_bm25_score": meta.get("retrieval_bm25_score"),
+                    "retrieval_dense_rank": meta.get("retrieval_dense_rank"),
+                    "retrieval_lexical_rank": meta.get("retrieval_lexical_rank"),
+                    "retrieval_sibling": bool(meta.get("retrieval_sibling", False)),
+                    "security_flags": list(meta.get("security_flags") or []),
                 }
             )
+        record("context_source_count", len(sources))
+        record("context_chars", used_chars)
         return "\n\n".join(blocks), sources
 
     def _generate_answer(
@@ -344,13 +414,14 @@ class InsightPDFRAG:
                 ),
             },
         ]
-        return self.llm.chat(
-            "rag",
-            messages,
-            temperature=0.02,
-            num_predict=800,
-            timeout=30,
-        ).strip()
+        with stage("answer_generation"):
+            return self.llm.chat(
+                "rag",
+                messages,
+                temperature=0.02,
+                num_predict=800,
+                timeout=30,
+            ).strip()
 
     def chat(
         self,
