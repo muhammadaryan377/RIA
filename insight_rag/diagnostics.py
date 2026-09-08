@@ -37,14 +37,16 @@ def event(name: str, value=True) -> None:
 
 @contextmanager
 def stage(name: str):
-    """Measure one pipeline stage without storing request content."""
+    """Measure one pipeline stage without ever changing exception semantics."""
     started = time.perf_counter()
     try:
         yield
     finally:
+        # Do not ``return`` from this finally block. A generator-contextmanager
+        # return while an exception is being thrown into it can suppress the
+        # application exception, which would make observability change behavior.
         trace = TRACE.get()
-        if trace is None:
-            return
-        timings = trace.setdefault("timings_ms", {})
-        elapsed = round((time.perf_counter() - started) * 1000, 2)
-        timings[name] = round(float(timings.get(name, 0.0) or 0.0) + elapsed, 2)
+        if trace is not None:
+            timings = trace.setdefault("timings_ms", {})
+            elapsed = round((time.perf_counter() - started) * 1000, 2)
+            timings[name] = round(float(timings.get(name, 0.0) or 0.0) + elapsed, 2)
