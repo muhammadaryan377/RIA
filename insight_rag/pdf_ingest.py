@@ -1,11 +1,13 @@
-"""Text-based PDF ingestion with explicit table preservation.
+"""Text-based PDF ingestion with table preservation and extraction quality.
 
-V1 scope:
+Supported scope:
 - digitally generated/text PDFs
 - normal paragraphs/headings
 - tables extractable by pdfplumber
 
-Scanned/image-only PDFs are deliberately rejected for now.
+Scanned/image-only PDFs are deliberately rejected for now.  Every extracted
+chunk is treated as untrusted evidence; instruction-like text is flagged for
+observability but never executed as model instructions.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from .config import TABLE_ROWS_PER_CHUNK, TEXT_CHUNK_OVERLAP, TEXT_CHUNK_SIZE
+from .enterprise_quality import assess_ingestion_quality, scan_untrusted_instructions
 
 _WHITESPACE_RE = re.compile(r"[ \t]+")
 
@@ -85,13 +88,21 @@ def _stable_chunk_id(document_id: str, kind: str, page: int, ordinal: int) -> st
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"aria-pdf:{document_id}:{kind}:{page}:{ordinal}"))
 
 
+def _security_metadata(text: str) -> dict:
+    flags = scan_untrusted_instructions(text)
+    return {
+        "security_flags": flags,
+        "contains_instruction_like_text": bool(flags),
+    }
+
+
 def extract_pdf_documents(
     pdf_path: str | Path,
     *,
     document_id: str,
     filename: str,
 ) -> tuple[list[Document], dict]:
-    """Extract LangChain Documents for page text and tables."""
+    """Extract LangChain Documents plus an auditable ingestion-quality report."""
     try:
         import fitz
     except ImportError as exc:
@@ -114,6 +125,8 @@ def extract_pdf_documents(
     table_count = 0
     text_chunk_count = 0
     table_chunk_count = 0
+    instruction_like_chunks = 0
+    page_text_chars: list[int] = []
 
     with fitz.open(path) as fitz_doc, pdfplumber.open(path) as plumber_doc:
         page_count = len(fitz_doc)
@@ -121,9 +134,12 @@ def extract_pdf_documents(
             page_number = page_index + 1
             page_text = _clean_text(fitz_doc[page_index].get_text("text"))
             text_chars += len(page_text)
+            page_text_chars.append(len(page_text))
 
             if page_text:
                 for ordinal, chunk in enumerate(splitter.split_text(page_text)):
+                    security = _security_metadata(chunk)
+                    instruction_like_chunks += int(security["contains_instruction_like_text"])
                     documents.append(
                         Document(
                             page_content=chunk,
@@ -133,6 +149,7 @@ def extract_pdf_documents(
                                 "page": page_number,
                                 "content_type": "text",
                                 "chunk_id": _stable_chunk_id(document_id, "text", page_number, ordinal),
+                                **security,
                             },
                         )
                     )
@@ -153,6 +170,8 @@ def extract_pdf_documents(
                 for ordinal, table_text in enumerate(table_chunks):
                     if not table_text.strip():
                         continue
+                    security = _security_metadata(table_text)
+                    instruction_like_chunks += int(security["contains_instruction_like_text"])
                     documents.append(
                         Document(
                             page_content=table_text,
@@ -168,6 +187,7 @@ def extract_pdf_documents(
                                 "chunk_id": _stable_chunk_id(
                                     document_id, f"table-{table_index}", page_number, ordinal
                                 ),
+                                **security,
                             },
                         )
                     )
@@ -181,11 +201,22 @@ def extract_pdf_documents(
     if not documents:
         raise ValueError("No usable text or tables could be extracted from this PDF.")
 
+    quality = assess_ingestion_quality(
+        pages=page_count,
+        text_chars=text_chars,
+        page_text_chars=page_text_chars,
+        tables=table_count,
+        instruction_like_chunks=instruction_like_chunks,
+    )
+
     return documents, {
         "pages": page_count,
         "text_chars": text_chars,
+        "page_text_chars": page_text_chars,
         "tables": table_count,
         "text_chunks": text_chunk_count,
         "table_chunks": table_chunk_count,
         "total_chunks": len(documents),
+        "instruction_like_chunks": instruction_like_chunks,
+        "ingestion_quality": quality,
     }
