@@ -5,7 +5,9 @@ RAG is an Insight Agent capability, not a fifth autonomous agent.
 
 from __future__ import annotations
 
+import os
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -14,7 +16,13 @@ from pydantic import BaseModel, Field
 from core.deps import require_writable
 from insight_agent_industry import InsightAgent
 from insight_rag import InsightPDFRAG
-from insight_rag.config import MAX_PDF_MB, RAG_LLM_MODEL
+from insight_rag.config import (
+    MAX_PDF_MB,
+    RAG_DATABASE_URL,
+    RAG_LLM_MODEL,
+    RAG_PIPELINE_VERSION,
+    validate_rag_config,
+)
 from insight_rag.storage import RAGMetadataStore, UserPGVectorStore
 from llm_provider import create_provider
 
@@ -23,8 +31,8 @@ router = APIRouter(prefix="/api/insight/pdf", tags=["Insight PDF RAG"])
 
 class PDFChatRequest(BaseModel):
     question: str = Field(min_length=2, max_length=4000)
-    conversation_id: str | None = None
-    document_ids: list[str] | None = None
+    conversation_id: str | None = Field(default=None, max_length=80)
+    document_ids: list[str] | None = Field(default=None, max_length=20)
 
 
 def _capability(user_id: str | int) -> InsightPDFRAG:
@@ -40,6 +48,38 @@ def _capability(user_id: str | int) -> InsightPDFRAG:
     )
     insight_agent = InsightAgent(provider=provider)
     return InsightPDFRAG(insight_agent=insight_agent, user_id=user_id)
+
+
+@router.get("/health")
+def pdf_rag_health(user: dict = Depends(require_writable)):
+    """Authenticated readiness/quality snapshot without exposing secrets or PDF text."""
+    config_error = None
+    try:
+        validate_rag_config()
+    except RuntimeError as exc:
+        config_error = str(exc)
+
+    documents = RAGMetadataStore(user["user_id"]).list_documents()
+    quality_counts = Counter(
+        str((document.get("ingestion_quality") or {}).get("grade") or "unknown")
+        for document in documents
+    )
+    provider_configured = bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
+    database_configured = bool(RAG_DATABASE_URL)
+    ready = not config_error and provider_configured and database_configured
+    return {
+        "ok": True,
+        "ready": ready,
+        "status": "ready" if ready else "degraded",
+        "pipeline_version": RAG_PIPELINE_VERSION,
+        "model": RAG_LLM_MODEL,
+        "provider_configured": provider_configured,
+        "database_configured": database_configured,
+        "config_valid": config_error is None,
+        "config_error": config_error,
+        "documents": len(documents),
+        "ingestion_quality": dict(quality_counts),
+    }
 
 
 @router.post("/upload")
@@ -101,7 +141,7 @@ def list_pdf_documents(user: dict = Depends(require_writable)):
         {key: value for key, value in document.items() if key != "chunk_ids"}
         for document in documents
     ]
-    return {"ok": True, "documents": public_docs}
+    return {"ok": True, "documents": public_docs, "pipeline_version": RAG_PIPELINE_VERSION}
 
 
 @router.delete("/documents/{document_id}")
