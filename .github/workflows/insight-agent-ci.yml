@@ -20,12 +20,7 @@ on:
       - "tests/test_decision_intelligence.py"
       - "tests/test_industry_insight_agent.py"
       - "tests/test_insight_rag*"
-      - "tests/test_insight_rag_context_engine.py"
-      - "tests/test_insight_rag_context_engineering.py"
-      - "tests/test_insight_rag_conversation.py"
-      - "tests/test_insight_rag_conversation_layer.py"
-      - "tests/test_insight_rag_structured_router.py"
-      - "tests/test_insight_rag_table_reasoner.py"
+      - "tests/test_rag_*.py"
       - "requirements.txt"
       - "requirements_insight_advanced.txt"
       - ".github/workflows/insight-agent-ci.yml"
@@ -48,12 +43,7 @@ on:
       - "tests/test_decision_intelligence.py"
       - "tests/test_industry_insight_agent.py"
       - "tests/test_insight_rag*"
-      - "tests/test_insight_rag_context_engine.py"
-      - "tests/test_insight_rag_context_engineering.py"
-      - "tests/test_insight_rag_conversation.py"
-      - "tests/test_insight_rag_conversation_layer.py"
-      - "tests/test_insight_rag_structured_router.py"
-      - "tests/test_insight_rag_table_reasoner.py"
+      - "tests/test_rag_*.py"
       - "requirements.txt"
       - "requirements_insight_advanced.txt"
       - ".github/workflows/insight-agent-ci.yml"
@@ -91,13 +81,17 @@ jobs:
           python -m py_compile insight_agent_industry.py
           python -m py_compile insight_extensions/decision_intelligence.py
           python -m py_compile prediction/tabular.py
+          python -m py_compile insight_rag/answer_stability.py
           python -m py_compile insight_rag/config.py
           python -m py_compile insight_rag/context_engine.py
           python -m py_compile insight_rag/conversation_layer.py
           python -m py_compile insight_rag/evidence.py
           python -m py_compile insight_rag/final_layer.py
           python -m py_compile insight_rag/friendly.py
+          python -m py_compile insight_rag/grounding.py
           python -m py_compile insight_rag/pdf_ingest.py
+          python -m py_compile insight_rag/presentation.py
+          python -m py_compile insight_rag/provider_stability.py
           python -m py_compile insight_rag/reranker.py
           python -m py_compile insight_rag/runtime_profile.py
           python -m py_compile insight_rag/scope_layer.py
@@ -105,14 +99,15 @@ jobs:
           python -m py_compile insight_rag/service.py
           python -m py_compile insight_rag/storage.py
           python -m py_compile insight_rag/table_reasoner.py
+          python -m py_compile insight_rag/verification_stability.py
 
       - name: Verify application wiring
         run: |
           python -m pytest -q tests/test_app_wiring.py
 
-      - name: Run RAG context-engineering tests
+      - name: Run all PDF-RAG tests
         run: |
-          ARIA_RAG_RERANKER_ENABLED=false python -m pytest -q tests/test_insight_rag*.py
+          ARIA_RAG_RERANKER_ENABLED=false python -m pytest -q tests/test_insight_rag*.py tests/test_rag_*.py
 
       - name: Run python app.py smoke test
         shell: bash
