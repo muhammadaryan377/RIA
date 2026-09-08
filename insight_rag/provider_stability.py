@@ -48,6 +48,7 @@ def apply_provider_stability_patches() -> None:
 
     original_validate_rich = SemanticRouter._validate_rich
     original_messages = SemanticRouter._messages
+    original_normalise = SemanticRouter._normalise
     original_compact_validate = CompactRouterOutput.model_validate
     original_chat_structured = LLMProvider.chat_structured
 
@@ -56,6 +57,48 @@ def apply_provider_stability_patches() -> None:
 
     def compact_model_validate(cls, obj, *args, **kwargs):
         return original_compact_validate(_normalise_provider_payload(obj), *args, **kwargs)
+
+    def normalise(self, output, *, key_to_id, selected_set, documents, latency_ms):
+        """Resolve harmless bad document-key guesses when scope is unambiguous.
+
+        DeepSeek can occasionally return a filename-like token or generic label in
+        ``document_keys`` instead of one of the manifest keys (D1, D2, ...).  The
+        core router correctly treats unknown keys as unsafe when several PDFs are
+        eligible.  But when exactly one selected/eligible PDF exists, asking
+        "summarize my PDF" is not ambiguous: the UI selection is the stronger,
+        deterministic scope constraint.  Clear only the invalid model key in that
+        one-document case and let the core normalizer bind the sole eligible PDF.
+
+        Inventory count/list requests are also authoritative metadata operations;
+        they do not need a model-selected content key at all.
+        """
+        all_ids = [str(doc.get("document_id")) for doc in documents if doc.get("document_id")]
+        eligible_ids = [did for did in all_ids if not selected_set or did in selected_set]
+        requested_keys = [str(key).upper() for key in (getattr(output, "document_keys", None) or [])]
+        invalid_keys = [key for key in requested_keys if key not in key_to_id]
+
+        inventory_request = (
+            getattr(output, "scope", None) == "DOCUMENT"
+            and getattr(output, "task", None) == "DOCUMENT_METADATA"
+            and getattr(output, "metadata_kind", None) in {"INVENTORY_COUNT", "INVENTORY_LIST"}
+        )
+        single_document_request = (
+            getattr(output, "scope", None) == "DOCUMENT"
+            and len(eligible_ids) == 1
+            and bool(invalid_keys)
+        )
+
+        if inventory_request or single_document_request:
+            output = output.model_copy(update={"document_keys": []})
+
+        return original_normalise(
+            self,
+            output,
+            key_to_id=key_to_id,
+            selected_set=selected_set,
+            documents=documents,
+            latency_ms=latency_ms,
+        )
 
     def messages(question: str, *, manifest: str, history_text: str) -> list[dict]:
         routed = original_messages(question, manifest=manifest, history_text=history_text)
@@ -66,8 +109,11 @@ def apply_provider_stability_patches() -> None:
                 "scope=DOCUMENT and task=DOCUMENT_METADATA; never use DOCUMENT_METADATA as scope.\n"
                 "- For array fields such as document_keys, target_pages and table_operations, use [] "
                 "when there are no values. Never invent page numbers or document keys.\n"
+                "- document_keys may contain only exact manifest keys such as D1/D2. If exactly one "
+                "selected PDF exists and the user says 'my PDF', 'the PDF' or equivalent wording, "
+                "use that selected manifest key rather than a filename or generic word like PDF.\n"
                 "Semantic examples:\n"
-                "- A whole-document request like explaining or teaching the PDF is "
+                "- A whole-document request like explaining, teaching or summarizing the PDF is "
                 "DOCUMENT/DOCUMENT_SUMMARY with broad_query=true.\n"
                 "- If a previous assistant answer exists, a request to explain/simplify/rephrase that answer "
                 "without new facts is CONVERSATION/PREVIOUS_ANSWER with previous_action=TRANSFORM.\n"
@@ -103,6 +149,7 @@ def apply_provider_stability_patches() -> None:
 
     SemanticRouter._validate_rich = staticmethod(validate_rich)
     SemanticRouter._messages = staticmethod(messages)
+    SemanticRouter._normalise = normalise
     CompactRouterOutput.model_validate = classmethod(compact_model_validate)
     LLMProvider.chat_structured = chat_structured
     _PATCHED = True
