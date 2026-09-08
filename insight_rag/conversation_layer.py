@@ -64,8 +64,6 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
             label = str(source.get("source_id") or "").upper().strip()
             if label and label not in labels:
                 labels.append(label)
-        # Conversation persistence should already carry sources, but retain cited
-        # labels from the visible answer as a compatibility fallback.
         for label in _CITATION_RE.findall(str(previous.get("content") or "")):
             label = label.upper()
             if label not in labels:
@@ -74,7 +72,11 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
 
     @staticmethod
     def _remove_citations(text: str) -> str:
-        return _CITATION_RE.sub("", text or "").strip()
+        cleaned = _CITATION_RE.sub("", text or "")
+        # Removing a marker that appeared immediately before punctuation can leave
+        # a cosmetic space ("100 ."). Collapse only that presentation artifact.
+        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        return cleaned.strip()
 
     @staticmethod
     def _one_line(text: str) -> str:
@@ -82,13 +84,13 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
         return " ".join(text.split())
 
     def _generate_transformation(self, instruction: str, previous_text: str, *, directive) -> str:
-        """Generate only wording/layout; source markers are added by ARIA later."""
+        """Generate a wording/layout transformation with no new factual content."""
         clean_previous = self._remove_citations(previous_text)
         structured = getattr(self.llm, "chat_structured", None)
         instructions = [
             "Transform only the supplied previous answer exactly as requested.",
             "Do not add facts, examples, names, numbers, claims, or outside knowledge.",
-            "Do not output citation markers; ARIA preserves source attribution separately.",
+            "If structured output is requested, do not output citation markers because ARIA preserves source attribution separately.",
         ]
         if directive.shape == "ONE_LINE":
             instructions.append("Return one concise sentence on one physical line.")
@@ -130,8 +132,10 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
                 reasoning_effort="low",
             )
             payload = json.loads(raw)
-            transformed = str(payload.get("text") or "").strip()
+            transformed = self._remove_citations(str(payload.get("text") or "").strip())
         else:
+            # Compatibility path for local/test providers. If this provider
+            # already returns a valid prior citation set, keep its exact placement.
             transformed = self.llm.chat(
                 "rag",
                 [
@@ -140,7 +144,7 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
                         "role": "user",
                         "content": (
                             f"Transformation instruction:\n{instruction}\n\n"
-                            f"Previous answer:\n{clean_previous}"
+                            f"Previous answer:\n{previous_text}"
                         ),
                     },
                 ],
@@ -149,7 +153,6 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
                 timeout=20,
             ).strip()
 
-        transformed = self._remove_citations(transformed)
         if directive.shape == "ONE_LINE":
             transformed = self._one_line(transformed)
         elif directive.shape == "PARAGRAPH":
@@ -166,18 +169,27 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
         directive = infer_presentation(self.llm, instruction)
         labels = self._ordered_source_labels(previous)
         suffix = " ".join(f"[{label}]" for label in labels)
+        previous_sources = list(previous.get("sources") or [])
 
         # One retry is enough for stochastic wording/verification variance. Each
         # attempt must independently pass the source/citation and semantic checks.
         for _ in range(2):
             try:
-                text = self._generate_transformation(
+                generated = self._generate_transformation(
                     instruction,
                     previous_text,
                     directive=directive,
                 )
-                transformed = (f"{text} {suffix}" if suffix else text).strip()
-                if previous.get("sources") and citation_integrity(transformed, previous["sources"]) != "valid":
+                # A legacy/local provider may already have preserved valid source
+                # placement. Keep it exactly; otherwise attach the known source set
+                # deterministically to structured provider output.
+                if previous_sources and citation_integrity(generated, previous_sources) == "valid":
+                    transformed = generated
+                else:
+                    text = self._remove_citations(generated)
+                    transformed = (f"{text} {suffix}" if suffix else text).strip()
+
+                if previous_sources and citation_integrity(transformed, previous_sources) != "valid":
                     continue
                 verification = verify_transformation(
                     self.llm,
@@ -191,11 +203,12 @@ class InsightPDFRAG(GroundedInsightPDFRAG):
                 continue
 
         # A one-line fallback can be made deterministically without changing a
-        # single factual token: only bullets/newlines/extra whitespace are removed.
-        # This is safer than refusing a purely presentational request.
+        # single factual token: collapse only bullet/newline/whitespace layout and
+        # retain citation placement exactly where it already existed.
         if directive.shape == "ONE_LINE":
-            text = self._one_line(self._remove_citations(previous_text))
-            return (f"{text} {suffix}" if suffix else text).strip()
+            transformed = self._one_line(previous_text)
+            if not previous_sources or citation_integrity(transformed, previous_sources) == "valid":
+                return transformed
 
         raise ValueError("Transformation could not be verified")
 
