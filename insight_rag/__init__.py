@@ -1,7 +1,9 @@
-"""PDF RAG capability used by ARIA's existing Insight Agent.
+"""RAG capabilities used by ARIA's existing Insight Agent.
 
-This module extends Insight Agent with conversational document intelligence; it
-is intentionally not a fifth autonomous agent.
+The mature PDF pipeline remains available as ``InsightPDFRAG``. The
+``InsightMultiSourceRAG`` orchestration layer adds structured SQL/CSV retrieval
+and hybrid document + structured answers without creating a fifth autonomous
+agent.
 """
 
 from .provider_stability import apply_provider_stability_patches
@@ -22,4 +24,6 @@ apply_answer_stability_patches()
 apply_verification_stability_patches()
 apply_summary_retry_patch()
 
-__all__ = ["InsightPDFRAG"]
+from .multisource import InsightMultiSourceRAG
+
+__all__ = ["InsightPDFRAG", "InsightMultiSourceRAG"]
