@@ -26,6 +26,9 @@ def test_main_application_exposes_pipeline_routes():
         "/api/insight/pdf/documents",
         "/api/insight/pdf/documents/{document_id}",
         "/api/insight/pdf/chat",
+        "/api/insight/data/sources",
+        "/api/insight/data/health",
+        "/api/insight/data/chat",
         "/api/health",
         "/api/providers",
     }
